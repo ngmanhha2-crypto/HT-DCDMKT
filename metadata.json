@@ -1,0 +1,6 @@
+{
+  "name": "Hệ Thống Đối Chiếu Danh Mục Kỹ Thuật Y Tế Tự Động (Fuzzy Matching)",
+  "description": "Ứng dụng tự động đối chiếu danh mục kỹ thuật y tế từ file gốc sang Phụ lục 1 và Phụ lục 2 Thông tư 23/2024/TT-BYT bằng thuật toán khớp chuỗi mờ (Fuzzy Matching).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
