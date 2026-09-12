@@ -19,6 +19,11 @@ import {
   Plus,
   Trash2,
   PlusCircle,
+  GripVertical,
+  AlertTriangle,
+  ArrowUpDown,
+  ChevronUp,
+  ChevronDown,
 } from 'lucide-react';
 import { FileInspection, OutputColumnConfig, FileMappingConfig, ColumnSourceGroup, ExtraColumnDefinition } from '../types';
 import { DEFAULT_OUTPUT_COLUMNS } from '../utils/excelParser';
@@ -95,28 +100,146 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
   onReset,
 }) => {
   const [previewModalFile, setPreviewModalFile] = useState<FileInspection | null>(null);
+  // Cảnh báo thứ tự cột không hợp lệ (vượt quá số cột hoặc nhỏ hơn 1)
+  const [orderWarnings, setOrderWarnings] = useState<Record<string, string>>({});
+  // Trạng thái kéo thả (Drag and Drop) trên bảng xem trước
+  const [draggedColId, setDraggedColId] = useState<string | null>(null);
+  const [dragOverColId, setDragOverColId] = useState<string | null>(null);
 
   const allFilesUploaded = Boolean((fileGoc && filePL1 && filePL2) || usingSampleData);
 
-  // Cập nhật thứ tự hoặc đổi tên cột
+  // Cập nhật đổi tên cột
   const handleUpdateColumnTitle = (id: string, newTitle: string) => {
     setColumnsConfig((prev) =>
       prev.map((col) => (col.id === id ? { ...col, customTitle: newTitle } : col))
     );
   };
 
+  /**
+   * Cập nhật thứ tự cột thông minh (Smart Reordering & Swap):
+   * 1. Cảnh báo nếu số nhập vào vượt quá số cột đang chọn hoặc nhỏ hơn 1.
+   * 2. Hoán đổi thông minh: Ví dụ khi sửa cột 1 thành cột 2 thì cột 2 sẽ tự động chuyển thành cột 1.
+   */
   const handleUpdateColumnOrder = (id: string, newOrderStr: string) => {
+    const activeCols = columnsConfig.filter((c) => c.selected);
+    const maxOrder = activeCols.length;
+
+    if (newOrderStr.trim() === '') {
+      setOrderWarnings((prev) => ({
+        ...prev,
+        [id]: `Nhập từ 1 đến ${maxOrder}`,
+      }));
+      return;
+    }
+
     const newOrder = parseInt(newOrderStr, 10);
-    if (isNaN(newOrder) || newOrder < 1) return;
-    setColumnsConfig((prev) =>
-      prev.map((col) => (col.id === id ? { ...col, order: newOrder } : col))
-    );
+
+    // Cảnh báo nếu vượt quá số cột hiện đang chọn hoặc nhỏ hơn 1
+    if (isNaN(newOrder) || newOrder < 1 || newOrder > maxOrder) {
+      setOrderWarnings((prev) => ({
+        ...prev,
+        [id]: `Vượt quá giới hạn! Hiện chỉ có ${maxOrder} cột đang chọn (cho phép từ 1 đến ${maxOrder}).`,
+      }));
+      return;
+    }
+
+    // Xóa cảnh báo lỗi khi giá trị hợp lệ
+    setOrderWarnings((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    setColumnsConfig((prev) => {
+      const currentCol = prev.find((c) => c.id === id);
+      if (!currentCol || !currentCol.selected) return prev;
+
+      const oldOrder = currentCol.order;
+      if (oldOrder === newOrder) return prev;
+
+      // Tìm cột đang giữ số thứ tự newOrder để hoán đổi vị trí
+      const conflictingCol = prev.find(
+        (c) => c.selected && c.id !== id && c.order === newOrder
+      );
+
+      return prev.map((col) => {
+        if (col.id === id) {
+          return { ...col, order: newOrder };
+        }
+        if (conflictingCol && col.id === conflictingCol.id) {
+          // Tự động hoán đổi: Cột 2 chuyển thành cột 1
+          return { ...col, order: oldOrder };
+        }
+        return col;
+      });
+    });
   };
 
-  const handleToggleColumn = (id: string) => {
+  // Nút tăng/giảm nhanh thứ tự (Nudge Up / Down)
+  const handleNudgeOrder = (id: string, direction: 'UP' | 'DOWN') => {
+    const activeCols = [...columnsConfig]
+      .filter((c) => c.selected)
+      .sort((a, b) => a.order - b.order);
+
+    const currentIndex = activeCols.findIndex((c) => c.id === id);
+    if (currentIndex === -1) return;
+
+    const targetIndex = direction === 'UP' ? currentIndex - 1 : currentIndex + 1;
+    if (targetIndex < 0 || targetIndex >= activeCols.length) return;
+
+    const currentCol = activeCols[currentIndex];
+    const targetCol = activeCols[targetIndex];
+
     setColumnsConfig((prev) =>
-      prev.map((col) => (col.id === id ? { ...col, selected: !col.selected } : col))
+      prev.map((col) => {
+        if (col.id === currentCol.id) return { ...col, order: targetCol.order };
+        if (col.id === targetCol.id) return { ...col, order: currentCol.order };
+        return col;
+      })
     );
+
+    setOrderWarnings({});
+  };
+
+  // Chuẩn hóa thứ tự tất cả các cột đang chọn liên tục 1, 2, 3, ..., N
+  const handleNormalizeColumnOrders = () => {
+    setColumnsConfig((prev) => {
+      const active = [...prev].filter((c) => c.selected).sort((a, b) => a.order - b.order);
+      const orderMap = new Map<string, number>();
+      active.forEach((c, idx) => orderMap.set(c.id, idx + 1));
+      return prev.map((col) =>
+        orderMap.has(col.id) ? { ...col, order: orderMap.get(col.id)! } : col
+      );
+    });
+    setOrderWarnings({});
+  };
+
+  // Bật/tắt cột kèm tự động tái lập thứ tự 1..N gọn gàng
+  const handleToggleColumn = (id: string) => {
+    setColumnsConfig((prev) => {
+      const target = prev.find((c) => c.id === id);
+      if (!target) return prev;
+
+      if (!target.selected) {
+        // Bật cột lên: Gán số thứ tự tiếp theo
+        const activeCount = prev.filter((c) => c.selected).length;
+        return prev.map((col) =>
+          col.id === id ? { ...col, selected: true, order: activeCount + 1 } : col
+        );
+      } else {
+        // Tắt cột đi: Dồn lại 1..N cho các cột còn lại
+        const updated = prev.map((col) =>
+          col.id === id ? { ...col, selected: false } : col
+        );
+        const remaining = updated.filter((c) => c.selected).sort((a, b) => a.order - b.order);
+        const orderMap = new Map<string, number>();
+        remaining.forEach((c, idx) => orderMap.set(c.id, idx + 1));
+        return updated.map((col) =>
+          orderMap.has(col.id) ? { ...col, order: orderMap.get(col.id)! } : col
+        );
+      }
+    });
+    setOrderWarnings({});
   };
 
   const handleResetDefaultColumns = () => {
@@ -125,6 +248,68 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
       ...DEFAULT_OUTPUT_COLUMNS.map((col) => ({ ...col })),
       ...extraCols,
     ]);
+    setOrderWarnings({});
+  };
+
+  // Xử lý kéo thả (Drag and Drop) trên bảng xem trước
+  const handleDragStart = (e: React.DragEvent, id: string) => {
+    setDraggedColId(id);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', id);
+  };
+
+  const handleDragOver = (e: React.DragEvent, id: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (dragOverColId !== id) {
+      setDragOverColId(id);
+    }
+  };
+
+  const handleDragEnter = (e: React.DragEvent, id: string) => {
+    e.preventDefault();
+    setDragOverColId(id);
+  };
+
+  const handleDragLeave = () => {
+    // Để an toàn, không reset ngay nếu đang di chuyển giữa các thẻ con
+  };
+
+  const handleDrop = (e: React.DragEvent, targetId: string) => {
+    e.preventDefault();
+    if (!draggedColId || draggedColId === targetId) {
+      setDraggedColId(null);
+      setDragOverColId(null);
+      return;
+    }
+
+    setColumnsConfig((prev) => {
+      const active = [...prev].filter((c) => c.selected).sort((a, b) => a.order - b.order);
+      const fromIdx = active.findIndex((c) => c.id === draggedColId);
+      const toIdx = active.findIndex((c) => c.id === targetId);
+
+      if (fromIdx === -1 || toIdx === -1) return prev;
+
+      const reordered = [...active];
+      const [movedItem] = reordered.splice(fromIdx, 1);
+      reordered.splice(toIdx, 0, movedItem);
+
+      const orderMap = new Map<string, number>();
+      reordered.forEach((c, idx) => orderMap.set(c.id, idx + 1));
+
+      return prev.map((col) =>
+        orderMap.has(col.id) ? { ...col, order: orderMap.get(col.id)! } : col
+      );
+    });
+
+    setDraggedColId(null);
+    setDragOverColId(null);
+    setOrderWarnings({});
+  };
+
+  const handleDragEnd = () => {
+    setDraggedColId(null);
+    setDragOverColId(null);
   };
 
   // Nhóm các cột theo từng file tải lên
@@ -462,26 +647,55 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
       {/* Tab 2: Customize Output Table Columns & Ordering */}
       {currentStep === 2 && (
         <div className="p-6">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
             <div>
               <h3 className="text-base font-bold text-slate-900">
                 Danh sách tiêu đề bảng chia theo từng file tải lên
               </h3>
               <p className="text-xs text-slate-500 mt-1">
-                Nhập số thứ tự (STT) tương ứng số cột bạn muốn xuất hiện trong bảng dữ liệu mới, và đổi tên tiêu đề cột nếu cần.
+                Nhập số thứ tự (STT) tương ứng số cột bạn muốn xuất hiện trong bảng dữ liệu mới, hoặc kéo thả trực tiếp ở khung xem trước phía dưới.
               </p>
             </div>
 
             <div className="flex items-center gap-2 flex-shrink-0">
               <button
                 type="button"
+                id="btn-normalize-columns-order"
+                onClick={handleNormalizeColumnOrders}
+                title="Tự động đánh lại thứ tự liên tục 1, 2, 3... cho các cột đang chọn, loại bỏ hoàn toàn trùng lặp"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg text-indigo-700 hover:text-indigo-900 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 transition-colors cursor-pointer"
+              >
+                <ArrowUpDown className="w-3.5 h-3.5 text-indigo-600" />
+                Chuẩn hóa thứ tự 1 → N
+              </button>
+              <button
+                type="button"
                 id="btn-reset-columns-default"
                 onClick={handleResetDefaultColumns}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-slate-200 transition-colors"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-slate-200 transition-colors cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
                 Khôi phục mặc định
               </button>
+            </div>
+          </div>
+
+          {/* Quick Guidance Box */}
+          <div className="mb-6 p-3 bg-blue-50/80 border border-blue-200 rounded-xl flex items-start gap-3">
+            <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+            <div className="text-xs text-blue-900 leading-relaxed">
+              <span className="font-bold">Cải tiến sắp xếp thông minh & Kéo thả:</span>
+              <ul className="list-disc list-inside mt-1 space-y-0.5 text-blue-800">
+                <li>
+                  <strong>Tự động hoán đổi:</strong> Khi sửa cột 1 thành cột 2, cột 2 sẽ tự động chuyển thành cột 1.
+                </li>
+                <li>
+                  <strong>Cảnh báo tức thì:</strong> Cảnh báo màu đỏ nếu số nhập vào vượt quá số cột đang chọn (tối đa <strong>{activeSortedColumns.length} cột</strong>).
+                </li>
+                <li>
+                  <strong>Kéo thả trực quan:</strong> Nhấn giữ và kéo thả các thẻ tiêu đề ở khung màu đen bên dưới để đổi vị trí theo ý muốn.
+                </li>
+              </ul>
             </div>
           </div>
 
@@ -533,24 +747,59 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
                           </div>
                         </div>
 
-                        {/* Order Input */}
-                        <div className="flex items-center gap-2 md:w-3/12">
-                          <label
-                            htmlFor={`col-order-${col.id}`}
-                            className="text-xs text-slate-500 font-medium whitespace-nowrap"
-                          >
-                            Số thứ tự cột:
-                          </label>
-                          <input
-                            type="number"
-                            id={`col-order-${col.id}`}
-                            min={1}
-                            max={20}
-                            value={col.order}
-                            disabled={!col.selected}
-                            onChange={(e) => handleUpdateColumnOrder(col.id, e.target.value)}
-                            className="w-16 px-2.5 py-1.5 text-center text-sm font-bold border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 disabled:bg-slate-100 disabled:text-slate-400"
-                          />
+                        {/* Order Input with Smart Swap, Warning & Nudge Buttons */}
+                        <div className="flex flex-col md:w-3/12">
+                          <div className="flex items-center gap-2">
+                            <label
+                              htmlFor={`col-order-${col.id}`}
+                              className="text-xs text-slate-500 font-medium whitespace-nowrap"
+                            >
+                              Số thứ tự cột:
+                            </label>
+                            <div className="flex items-center">
+                              <input
+                                type="number"
+                                id={`col-order-${col.id}`}
+                                min={1}
+                                max={activeSortedColumns.length}
+                                value={col.order}
+                                disabled={!col.selected}
+                                onChange={(e) => handleUpdateColumnOrder(col.id, e.target.value)}
+                                className={`w-14 px-2 py-1.5 text-center text-sm font-bold border rounded-l-md focus:ring-2 disabled:bg-slate-100 disabled:text-slate-400 ${
+                                  orderWarnings[col.id]
+                                    ? 'border-rose-400 text-rose-700 bg-rose-50/80 focus:ring-rose-500 focus:border-rose-500'
+                                    : 'border-slate-300 text-slate-800 focus:ring-indigo-500 focus:border-indigo-500'
+                                }`}
+                              />
+                              <div className="flex flex-col border-y border-r border-slate-300 rounded-r-md overflow-hidden bg-slate-50">
+                                <button
+                                  type="button"
+                                  disabled={!col.selected || col.order <= 1}
+                                  onClick={() => handleNudgeOrder(col.id, 'UP')}
+                                  title="Chuyển lên trước 1 vị trí"
+                                  className="px-1.5 py-0.5 hover:bg-slate-200 disabled:opacity-30 disabled:cursor-not-allowed text-slate-600 transition-colors cursor-pointer"
+                                >
+                                  <ChevronUp className="w-3 h-3" />
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={!col.selected || col.order >= activeSortedColumns.length}
+                                  onClick={() => handleNudgeOrder(col.id, 'DOWN')}
+                                  title="Chuyển xuống sau 1 vị trí"
+                                  className="px-1.5 py-0.5 hover:bg-slate-200 disabled:opacity-30 disabled:cursor-not-allowed text-slate-600 transition-colors border-t border-slate-200 cursor-pointer"
+                                >
+                                  <ChevronDown className="w-3 h-3" />
+                                </button>
+                              </div>
+                            </div>
+                            <span className="text-[11px] text-slate-400">/{activeSortedColumns.length}</span>
+                          </div>
+                          {orderWarnings[col.id] && (
+                            <span className="text-[11px] font-semibold text-rose-600 flex items-center gap-1 mt-1">
+                              <AlertTriangle className="w-3 h-3 shrink-0" />
+                              {orderWarnings[col.id]}
+                            </span>
+                          )}
                         </div>
 
                         {/* Rename Title Input */}
@@ -580,29 +829,57 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
             })}
           </div>
 
-          {/* Real-time Header Preview Strip */}
-          <div className="mt-8 p-4 bg-slate-900 rounded-xl text-white">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
-                <Table className="w-3.5 h-3.5 text-indigo-400" />
+          {/* Real-time Header Preview Strip with Drag and Drop */}
+          <div className="mt-8 p-5 bg-slate-900 rounded-xl text-white shadow-md border border-slate-800">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-200 flex items-center gap-2">
+                <Table className="w-4 h-4 text-indigo-400" />
                 Xem trước dòng tiêu đề bảng kết quả mới ({activeSortedColumns.length} cột)
               </span>
-              <span className="text-xs text-slate-400">
-                Sắp xếp theo thứ tự cột từ trái sang phải
-              </span>
+              <div className="flex items-center gap-1.5 text-xs text-sky-300 bg-sky-950/70 px-2.5 py-1 rounded-md border border-sky-800/60">
+                <GripVertical className="w-3.5 h-3.5 text-sky-400" />
+                <span>Kéo thả thẻ để thay đổi thứ tự cột trực quan</span>
+              </div>
             </div>
-            <div className="flex flex-wrap gap-1.5 overflow-x-auto py-2">
-              {activeSortedColumns.map((col, idx) => (
-                <div
-                  key={col.id}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-slate-800 border border-slate-700 text-xs font-medium text-slate-200"
-                >
-                  <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[10px] font-bold">
-                    {col.order || idx + 1}
-                  </span>
-                  <span>{col.customTitle || col.defaultTitle}</span>
-                </div>
-              ))}
+
+            {/* Drag & Drop Badges Container */}
+            <div className="flex flex-wrap gap-2 overflow-x-auto py-2 min-h-[52px] items-center">
+              {activeSortedColumns.map((col, idx) => {
+                const isDragging = draggedColId === col.id;
+                const isDragOver = dragOverColId === col.id;
+
+                return (
+                  <div
+                    key={col.id}
+                    draggable
+                    onDragStart={(e) => handleDragStart(e, col.id)}
+                    onDragOver={(e) => handleDragOver(e, col.id)}
+                    onDragEnter={(e) => handleDragEnter(e, col.id)}
+                    onDragLeave={handleDragLeave}
+                    onDrop={(e) => handleDrop(e, col.id)}
+                    onDragEnd={handleDragEnd}
+                    title="Nhấn giữ và kéo thả thẻ này sang trái hoặc phải để thay đổi thứ tự cột"
+                    className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium select-none transition-all duration-150 cursor-grab active:cursor-grabbing ${
+                      isDragging
+                        ? 'opacity-30 scale-95 border-indigo-500 bg-indigo-950/60 ring-2 ring-indigo-400/50'
+                        : isDragOver
+                        ? 'border-sky-400 bg-sky-950 text-white ring-2 ring-sky-400 scale-105 shadow-lg shadow-sky-500/20 z-10'
+                        : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-750 hover:border-slate-500 hover:text-white'
+                    }`}
+                  >
+                    <GripVertical className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                    <span className="w-5 h-5 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[11px] font-bold shrink-0 shadow-xs">
+                      {col.order || idx + 1}
+                    </span>
+                    <span className="font-semibold">{col.customTitle || col.defaultTitle}</span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-2.5 pt-2 border-t border-slate-800 text-[11px] text-slate-400 flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+              <span>Sắp xếp theo thứ tự cột từ trái sang phải</span>
+              <span className="italic text-sky-400">💡 Thứ tự cột được tự động đồng bộ tức thì sang file Excel xuất ra và bảng kết quả</span>
             </div>
           </div>
 
