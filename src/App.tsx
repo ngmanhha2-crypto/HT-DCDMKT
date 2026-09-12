@@ -1,4 +1,4 @@
-import React, { useState, useId, useRef, useMemo } from 'react';
+import React, { useState, useId, useRef, useMemo, useEffect, useCallback } from 'react';
 import {
   FileSpreadsheet,
   Upload,
@@ -36,6 +36,9 @@ import {
   FileText,
   ChevronDown,
   ChevronUp,
+  X,
+  Filter,
+  Keyboard,
 } from 'lucide-react';
 import { SourceItem, TargetItem, MappingResult, ProcessingStats, FileInspection, OutputColumnConfig, FileMappingConfig, ExtraColumnDefinition } from './types';
 import { auditMappingRowWithRules } from './utils/clinicalRules';
@@ -66,6 +69,75 @@ import {
 import { DeployGuideModal } from './components/DeployGuideModal';
 import { ClinicalAuditModal } from './components/ClinicalAuditModal';
 import { FileColumnWorkflow } from './components/FileColumnWorkflow';
+import { KeyboardShortcutsModal } from './components/KeyboardShortcutsModal';
+
+/**
+ * Kiểm tra xem một dòng kết quả kỹ thuật có khớp với tiêu chí lọc Chuyên khoa hay không.
+ * Hỗ trợ cả 2 phương thức:
+ * 1. Chuyên khoa / Phân chương tự động trích xuất từ file gốc (ví dụ: "IX. Tai mũi họng", "VIII. Răng hàm mặt")
+ * 2. Phân loại theo Hệ cơ quan y sinh & Giải phẫu lâm sàng (ví dụ: "onto:Tai - Mũi - Họng")
+ */
+function matchRowSpecialty(
+  rowSpecialty?: string,
+  rowAnatomy?: string,
+  filterValue?: string
+): boolean {
+  if (!filterValue || filterValue === 'all') return true;
+  if (!rowSpecialty && !rowAnatomy) return false;
+
+  const filterStr = filterValue.trim();
+
+  // 1. Phân loại theo Hệ cơ quan Y sinh (Ontology)
+  if (filterStr.startsWith('onto:')) {
+    const ontoName = filterStr.replace('onto:', '').toLowerCase();
+    const cleanOnto = ontoName.replace(/[\-\/\,]/g, ' ').replace(/\s+/g, ' ').trim();
+    const cleanRowSpec = (rowSpecialty || '').toLowerCase().replace(/[\-\/\,]/g, ' ').replace(/\s+/g, ' ').trim();
+    const cleanRowAnat = (rowAnatomy || '').toLowerCase().replace(/[\-\/\,]/g, ' ').replace(/\s+/g, ' ').trim();
+
+    if (
+      cleanRowSpec === cleanOnto ||
+      cleanRowSpec.includes(cleanOnto) ||
+      cleanOnto.includes(cleanRowSpec) ||
+      cleanRowAnat.includes(cleanOnto)
+    ) {
+      return true;
+    }
+
+    const tokens = cleanOnto.split(' ').filter((t) => t.length >= 3);
+    if (tokens.length > 0) {
+      const matched = tokens.filter((t) => cleanRowSpec.includes(t) || cleanRowAnat.includes(t));
+      if (matched.length >= Math.min(2, tokens.length)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // 2. Chuyên khoa & Loại danh mục theo File Gốc (ví dụ: "SAU SINH", "IX. Tai mũi họng", "Sản phụ khoa > SAU SINH")
+  if (rowSpecialty) {
+    if (rowSpecialty.trim().toLowerCase() === filterStr.toLowerCase()) {
+      return true;
+    }
+
+    // So khớp nhanh nếu có ký hiệu phân cấp '>' hoặc '-'
+    const parts = rowSpecialty.split(/\s*[\>\-]\s*/).map((p) => p.trim().toLowerCase());
+    if (parts.some((p) => p === filterStr.toLowerCase())) {
+      return true;
+    }
+
+    const normRow = rowSpecialty.replace(/^([IVXLCDM0-9]+)[\.\:\-\s]+/i, '').trim().toLowerCase();
+    const normFilter = filterStr.replace(/^([IVXLCDM0-9]+)[\.\:\-\s]+/i, '').trim().toLowerCase();
+    if (normRow && normFilter && (normRow === normFilter || normRow.includes(normFilter) || normFilter.includes(normRow))) {
+      return true;
+    }
+  }
+
+  if (rowAnatomy && rowAnatomy.toLowerCase().includes(filterStr.toLowerCase())) {
+    return true;
+  }
+
+  return false;
+}
 
 export default function App() {
   const uploadGocId = useId();
@@ -74,6 +146,19 @@ export default function App() {
 
   // Modal Deploy Hướng dẫn GitHub & Vercel
   const [isDeployModalOpen, setIsDeployModalOpen] = useState<boolean>(false);
+
+  // Modal Bảng tra cứu phím tắt bàn phím
+  const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState<boolean>(false);
+
+  // Thông báo phản hồi phím tắt tức thì (Visual Feedback Toast)
+  const [shortcutToast, setShortcutToast] = useState<{ message: string; type?: 'info' | 'success' | 'warning' } | null>(null);
+
+  const showShortcutFeedback = useCallback((message: string, type: 'info' | 'success' | 'warning' = 'info') => {
+    setShortcutToast({ message, type });
+    setTimeout(() => {
+      setShortcutToast((prev) => (prev?.message === message ? null : prev));
+    }, 2500);
+  }, []);
 
   // State quản lý file
   const [fileGoc, setFileGoc] = useState<File | null>(null);
@@ -516,7 +601,7 @@ export default function App() {
             qtktBenhVien: '',
             soDonViThucHien: '',
             boPhanGoc: sourceComp.anatomyList.length > 0 ? sourceComp.anatomyList.join(', ') : undefined,
-            chuyenKhoaGoc: item.chapter || (sourceComp.primaryCategory ? ANATOMY_ONTOLOGY[sourceComp.primaryCategory]?.name : undefined),
+            chuyenKhoaGoc: item.chapter || (sourceComp.primaryCategory ? ANATOMY_ONTOLOGY[sourceComp.primaryCategory]?.name : undefined) || 'Chưa phân loại',
             boPhanPL1: matchPL1.anatomy,
             boPhanPL2: matchPL2.anatomy,
             extraValues,
@@ -740,6 +825,93 @@ export default function App() {
   // Số lượng cảnh báo phát hiện
   const warningCount = results.filter((r) => r.aiAudit?.hasWarning).length;
 
+  // Phân loại và tổng hợp danh mục chuyên khoa động từ dữ liệu thực tế của file gốc và hệ giải phẫu
+  const specialtyClassification = useMemo(() => {
+    if (!results || results.length === 0) {
+      return {
+        sourceSpecialties: [] as { name: string; count: number }[],
+        ontologySpecialties: Object.values(ANATOMY_ONTOLOGY).map((cat) => ({
+          name: cat.name,
+          count: 0,
+        })),
+        totalProcedures: 0,
+      };
+    }
+
+    const sourceMap = new Map<string, number>();
+    const ontoMap = new Map<string, number>();
+
+    for (const cat of Object.values(ANATOMY_ONTOLOGY)) {
+      ontoMap.set(cat.name, 0);
+    }
+
+    for (const row of results) {
+      const spec = row.chuyenKhoaGoc?.trim();
+      if (spec) {
+        sourceMap.set(spec, (sourceMap.get(spec) || 0) + 1);
+
+        // Nếu có phân cấp "Chương > Loại danh mục", cho phép hiển thị và lọc theo Loại danh mục con độc lập
+        if (spec.includes('>')) {
+          const subCategory = spec.split('>').pop()?.trim();
+          if (subCategory && subCategory !== spec) {
+            sourceMap.set(subCategory, (sourceMap.get(subCategory) || 0) + 1);
+          }
+        }
+      }
+
+      for (const cat of Object.values(ANATOMY_ONTOLOGY)) {
+        if (matchRowSpecialty(row.chuyenKhoaGoc, row.boPhanGoc, `onto:${cat.name}`)) {
+          ontoMap.set(cat.name, (ontoMap.get(cat.name) || 0) + 1);
+        }
+      }
+    }
+
+    // Chuyển số La Mã thành số nguyên để sắp xếp đúng thứ tự chương I, II, III... IX, X...
+    const romanToInt = (r: string) => {
+      const vals: Record<string, number> = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+      let num = 0;
+      for (let i = 0; i < r.length; i++) {
+        const curr = vals[r[i].toUpperCase()] || 0;
+        const next = vals[r[i + 1]?.toUpperCase()] || 0;
+        if (curr < next) num -= curr;
+        else num += curr;
+      }
+      return num;
+    };
+
+    const sourceSpecialties = Array.from(sourceMap.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => {
+        const romanA = a.name.match(/^([IVXLCDM]+)\./i);
+        const romanB = b.name.match(/^([IVXLCDM]+)\./i);
+        if (romanA && romanB) {
+          return romanToInt(romanA[1]) - romanToInt(romanB[1]);
+        }
+        if (romanA && !romanB) return -1;
+        if (!romanA && romanB) return 1;
+        return a.name.localeCompare(b.name, 'vi');
+      });
+
+    const ontologySpecialties = Array.from(ontoMap.entries())
+      .filter(([_, count]) => count > 0)
+      .map(([name, count]) => ({ name, count }));
+
+    return {
+      sourceSpecialties,
+      ontologySpecialties,
+      totalProcedures: results.length,
+    };
+  }, [results]);
+
+  // Nhãn chuyên khoa đang kích hoạt lọc
+  const activeSpecialtyLabel = useMemo(() => {
+    if (selectedSpecialty === 'all') return '';
+    if (selectedSpecialty.startsWith('onto:')) {
+      return selectedSpecialty.replace('onto:', '');
+    }
+    return selectedSpecialty;
+  }, [selectedSpecialty]);
+
   // Lọc kết quả tìm kiếm và bộ lọc trạng thái
   const filteredResults = results.filter((r) => {
     // Lọc theo trạng thái
@@ -749,12 +921,11 @@ export default function App() {
     if (statusFilter === 'pl2_only' && (r.tenPL1 || !r.tenPL2)) return false;
     if (statusFilter === 'unmatched' && (r.tenPL1 || r.tenPL2)) return false;
 
-    // Lọc theo Chuyên khoa / Bộ phận giải phẫu
+    // Lọc theo Chuyên khoa / Bộ phận giải phẫu (Tương thích cả phân chương file gốc và hệ cơ quan y sinh)
     if (selectedSpecialty !== 'all') {
-      const matchSpecialty =
-        r.chuyenKhoaGoc === selectedSpecialty ||
-        (r.boPhanGoc && r.boPhanGoc.toLowerCase().includes(selectedSpecialty.toLowerCase()));
-      if (!matchSpecialty) return false;
+      if (!matchRowSpecialty(r.chuyenKhoaGoc, r.boPhanGoc, selectedSpecialty)) {
+        return false;
+      }
     }
 
     // Lọc theo từ khóa tìm kiếm
@@ -785,6 +956,212 @@ export default function App() {
       .filter((c) => c.selected)
       .sort((a, b) => a.order - b.order);
   }, [columnsConfig]);
+
+  // Theo dõi trạng thái mới nhất cho bàn phím để tránh stale closure
+  const keyboardStateRef = useRef({
+    results,
+    totalPages,
+    currentPage: validCurrentPage,
+    isProcessing,
+    usingSampleData,
+    fileGoc,
+    filePL1,
+    filePL2,
+    isShortcutsModalOpen,
+    auditModalRow,
+    isDeployModalOpen,
+  });
+
+  useEffect(() => {
+    keyboardStateRef.current = {
+      results,
+      totalPages,
+      currentPage: validCurrentPage,
+      isProcessing,
+      usingSampleData,
+      fileGoc,
+      filePL1,
+      filePL2,
+      isShortcutsModalOpen,
+      auditModalRow,
+      isDeployModalOpen,
+    };
+  }, [
+    results,
+    totalPages,
+    validCurrentPage,
+    isProcessing,
+    usingSampleData,
+    fileGoc,
+    filePL1,
+    filePL2,
+    isShortcutsModalOpen,
+    auditModalRow,
+    isDeployModalOpen,
+  ]);
+
+  // Đăng ký các phím tắt bàn phím toàn cục cho cán bộ y tế
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+      const cmdOrCtrl = isMac ? e.metaKey : e.ctrlKey;
+      const target = e.target as HTMLElement | null;
+      const isTyping =
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+
+      const state = keyboardStateRef.current;
+
+      // 1. Phím tắt Ctrl + Enter (hoặc Cmd + Enter): Bắt đầu chạy Mapping
+      if (cmdOrCtrl && e.key === 'Enter') {
+        e.preventDefault();
+        if (state.isProcessing) {
+          showShortcutFeedback('Tiến trình đối chiếu đang chạy, vui lòng đợi...', 'info');
+          return;
+        }
+
+        const canMap = (state.fileGoc && state.filePL1 && state.filePL2) || state.usingSampleData;
+        if (canMap) {
+          showShortcutFeedback('⚡ Ctrl+Enter: Đang bắt đầu đối chiếu danh mục & thẩm định AI...', 'success');
+          handleStartMapping();
+        } else {
+          showShortcutFeedback('⚡ Tự động nạp dữ liệu mẫu và chạy đối chiếu...', 'info');
+          handleLoadSampleData();
+          setTimeout(() => {
+            handleStartMapping();
+          }, 200);
+        }
+        return;
+      }
+
+      // 2. Phím tắt Ctrl + S (hoặc Cmd + S): Xuất file Excel đã tô vàng
+      if (cmdOrCtrl && (e.key === 's' || e.key === 'S') && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        if (state.results.length > 0) {
+          showShortcutFeedback('⚡ Ctrl+S: Đang xuất file Excel đã tô màu nền vàng...', 'success');
+          handleDownloadExcel();
+        } else {
+          showShortcutFeedback('Chưa có kết quả để xuất Excel. Nhấn Ctrl+Enter để chạy đối chiếu trước!', 'warning');
+        }
+        return;
+      }
+
+      // 3. Phím tắt Alt + S (hoặc Ctrl + Shift + S): Tải nhanh dữ liệu mẫu
+      if (
+        (e.altKey && (e.key === 's' || e.key === 'S')) ||
+        (cmdOrCtrl && e.shiftKey && (e.key === 's' || e.key === 'S'))
+      ) {
+        e.preventDefault();
+        handleLoadSampleData();
+        showShortcutFeedback('⚡ Alt+S: Đã nạp 12 danh mục kỹ thuật mẫu thực tế.', 'info');
+        return;
+      }
+
+      // 4. Phím tắt Ctrl + Shift + R: Reset dữ liệu
+      if (cmdOrCtrl && e.shiftKey && (e.key === 'r' || e.key === 'R')) {
+        e.preventDefault();
+        handleReset();
+        showShortcutFeedback('⚡ Ctrl+Shift+R: Đã làm mới trạng thái đối chiếu.', 'info');
+        return;
+      }
+
+      // 5. Phím tắt chuyển nhanh ô tìm kiếm: '/' hoặc Ctrl+F
+      if ((e.key === '/' && !isTyping) || (cmdOrCtrl && (e.key === 'f' || e.key === 'F'))) {
+        e.preventDefault();
+        const searchInput = document.getElementById('search-filter-input') as HTMLInputElement | null;
+        if (searchInput) {
+          searchInput.focus();
+          searchInput.select();
+          showShortcutFeedback('⚡ Đã chuyển con trỏ vào ô Tìm kiếm kỹ thuật (/ hoặc Ctrl+F)');
+        }
+        return;
+      }
+
+      // 6. Phím tắt lọc nhanh trạng thái kết quả (Alt + 1, Alt + 2, Alt + 3, Alt + 4)
+      if (e.altKey && e.key === '1') {
+        e.preventDefault();
+        setStatusFilter('all');
+        setCurrentPage(1);
+        showShortcutFeedback('Đang hiển thị tất cả các dòng kỹ thuật');
+        return;
+      }
+      if (e.altKey && e.key === '2') {
+        e.preventDefault();
+        setStatusFilter('warning_only');
+        setCurrentPage(1);
+        showShortcutFeedback('Đã lọc các dòng Cần lưu ý / Tô vàng 🟡', 'warning');
+        return;
+      }
+      if (e.altKey && e.key === '3') {
+        e.preventDefault();
+        setStatusFilter('both');
+        setCurrentPage(1);
+        showShortcutFeedback('Đã lọc các dòng khớp cả 2 Phụ lục', 'success');
+        return;
+      }
+      if (e.altKey && e.key === '4') {
+        e.preventDefault();
+        setStatusFilter('unmatched');
+        setCurrentPage(1);
+        showShortcutFeedback('Đã lọc các dòng chưa khớp', 'info');
+        return;
+      }
+
+      // 7. Phím tắt điều hướng phân trang (← / → khi không ở trong ô nhập liệu)
+      if (!isTyping) {
+        if ((e.altKey && e.key === 'ArrowLeft') || e.key === 'PageUp') {
+          e.preventDefault();
+          setCurrentPage((p) => Math.max(1, p - 1));
+          return;
+        }
+        if ((e.altKey && e.key === 'ArrowRight') || e.key === 'PageDown') {
+          e.preventDefault();
+          setCurrentPage((p) => Math.min(state.totalPages, p + 1));
+          return;
+        }
+      }
+
+      // 8. Phím tắt mở bảng tra cứu phím tắt '?'
+      if (!isTyping && (e.key === '?' || (e.shiftKey && e.key === '/'))) {
+        e.preventDefault();
+        setIsShortcutsModalOpen((prev) => !prev);
+        return;
+      }
+
+      // 9. Phím tắt Escape: Đóng các modal hoặc thoát ô tìm kiếm
+      if (e.key === 'Escape') {
+        if (state.isShortcutsModalOpen) {
+          setIsShortcutsModalOpen(false);
+          return;
+        }
+        if (state.auditModalRow) {
+          setAuditModalRow(null);
+          return;
+        }
+        if (state.isDeployModalOpen) {
+          setIsDeployModalOpen(false);
+          return;
+        }
+        if (isTyping && target) {
+          target.blur();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [
+    handleStartMapping,
+    handleDownloadExcel,
+    handleLoadSampleData,
+    handleReset,
+    showShortcutFeedback,
+  ]);
 
   return (
     <div id="medical-mapping-app" className="min-h-screen bg-slate-50 text-slate-900 font-sans">
@@ -821,14 +1198,31 @@ export default function App() {
             {/* Quick Action Buttons */}
             <div className="flex flex-wrap items-center gap-2 self-start lg:self-center shrink-0">
               <button
+                id="open-keyboard-shortcuts-btn"
+                type="button"
+                onClick={() => setIsShortcutsModalOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs sm:text-sm font-medium bg-white/10 hover:bg-white/20 border border-white/20 text-white transition-all cursor-pointer shadow-xs"
+                title="Bảng tra cứu phím tắt bàn phím tăng tốc làm việc (Phím tắt: ?)"
+              >
+                <Keyboard className="w-3.5 h-3.5 text-sky-300" />
+                <span>Phím Tắt</span>
+                <kbd className="hidden sm:inline-block px-1.5 py-0.2 rounded bg-white/20 text-[10px] font-mono text-white/90">
+                  ?
+                </kbd>
+              </button>
+
+              <button
                 id="load-sample-data-btn"
                 type="button"
                 onClick={handleLoadSampleData}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs sm:text-sm font-semibold bg-sky-600 hover:bg-sky-500 text-white shadow-xs transition-all cursor-pointer border border-sky-400/40 hover:shadow-md"
-                title="Tải ngay bộ dữ liệu y tế thực tế để kiểm tra và đối chiếu"
+                title="Tải ngay bộ dữ liệu y tế thực tế để kiểm tra và đối chiếu (Phím tắt: Alt+S)"
               >
                 <Layers className="w-3.5 h-3.5 text-sky-200" />
-                Dữ Liệu Mẫu
+                <span>Dữ Liệu Mẫu</span>
+                <kbd className="hidden sm:inline-block px-1.5 py-0.2 rounded bg-sky-700/80 text-[10px] font-mono text-sky-100 border border-sky-400/30">
+                  Alt+S
+                </kbd>
               </button>
 
               <button
@@ -1041,11 +1435,14 @@ export default function App() {
                     id="download-excel-result-btn"
                     type="button"
                     onClick={handleDownloadExcel}
-                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs transition-colors cursor-pointer"
-                    title="Xuất file Excel đã tự động tô màu nền vàng các dòng AI cảnh báo"
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs transition-colors cursor-pointer border border-emerald-500/40"
+                    title="Xuất file Excel đã tự động tô màu nền vàng các dòng AI cảnh báo (Phím tắt: Ctrl+S)"
                   >
                     <Download className="w-4 h-4" />
                     <span>Xuất Excel Đã Tô Vàng (.xlsx)</span>
+                    <kbd className="hidden sm:inline-block px-1.5 py-0.5 rounded bg-emerald-800/80 text-[10px] font-mono font-semibold text-emerald-100 border border-emerald-400/40">
+                      Ctrl+S
+                    </kbd>
                   </button>
                 </div>
               </div>
@@ -1089,6 +1486,7 @@ export default function App() {
                 <div className="flex flex-wrap items-center gap-1.5 text-xs">
                   <button
                     onClick={() => { setStatusFilter('all'); setCurrentPage(1); }}
+                    title="Hiển thị tất cả dòng kỹ thuật (Phím tắt: Alt+1)"
                     className={`px-3 py-1.5 rounded-lg font-medium transition-colors cursor-pointer ${
                       statusFilter === 'all'
                         ? 'bg-slate-900 text-white'
@@ -1100,6 +1498,7 @@ export default function App() {
                   <button
                     id="filter-tab-warning-yellow-btn"
                     onClick={() => { setStatusFilter('warning_only'); setCurrentPage(1); }}
+                    title="Lọc nhanh các dòng AI phát hiện nghi vấn hoặc chưa đồng nhất (Phím tắt: Alt+2)"
                     className={`px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
                       statusFilter === 'warning_only'
                         ? 'bg-amber-400 text-amber-950 ring-2 ring-amber-500 shadow-xs'
@@ -1111,6 +1510,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => { setStatusFilter('both'); setCurrentPage(1); }}
+                    title="Lọc các dòng đã khớp cả 2 Phụ lục 1 & 2 (Phím tắt: Alt+3)"
                     className={`px-3 py-1.5 rounded-lg font-medium transition-colors cursor-pointer ${
                       statusFilter === 'both'
                         ? 'bg-emerald-700 text-white'
@@ -1141,6 +1541,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => { setStatusFilter('unmatched'); setCurrentPage(1); }}
+                    title="Lọc các dòng chưa tìm thấy kỹ thuật tương đương (Phím tắt: Alt+4)"
                     className={`px-3 py-1.5 rounded-lg font-medium transition-colors cursor-pointer ${
                       statusFilter === 'unmatched'
                         ? 'bg-amber-700 text-white'
@@ -1153,19 +1554,50 @@ export default function App() {
 
                 {/* Search, Specialty & Page Size */}
                 <div className="flex items-center flex-wrap gap-2">
-                  <select
-                    id="specialty-filter-select"
-                    value={selectedSpecialty}
-                    onChange={(e) => { setSelectedSpecialty(e.target.value); setCurrentPage(1); }}
-                    className="text-xs bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-700 cursor-pointer font-medium"
-                  >
-                    <option value="all">🩺 Tất cả chuyên khoa</option>
-                    {Object.values(ANATOMY_ONTOLOGY).map((cat) => (
-                      <option key={cat.name} value={cat.name}>
-                        {cat.name}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="flex items-center gap-1.5">
+                    <select
+                      id="specialty-filter-select"
+                      value={selectedSpecialty}
+                      onChange={(e) => { setSelectedSpecialty(e.target.value); setCurrentPage(1); }}
+                      className="text-xs bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-700 cursor-pointer font-medium max-w-[240px] sm:max-w-[290px] truncate transition-colors shadow-xs"
+                      title="Chọn chuyên khoa hoặc loại danh mục để lọc dữ liệu kỹ thuật"
+                    >
+                      <option value="all">🩺 Tất cả chuyên khoa & loại danh mục ({specialtyClassification.totalProcedures})</option>
+
+                      {specialtyClassification.sourceSpecialties.length > 0 && (
+                        <optgroup label={`📂 Theo Loại danh mục & Phân chương File Gốc (${specialtyClassification.sourceSpecialties.length} mục)`}>
+                          {specialtyClassification.sourceSpecialties.map((s) => (
+                            <option key={`src-${s.name}`} value={s.name}>
+                              📂 {s.name} ({s.count})
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+
+                      {specialtyClassification.ontologySpecialties.length > 0 && (
+                        <optgroup label={`🧬 Theo Hệ cơ quan & Giải phẫu y sinh (${specialtyClassification.ontologySpecialties.length} nhóm)`}>
+                          {specialtyClassification.ontologySpecialties.map((o) => (
+                            <option key={`onto-${o.name}`} value={`onto:${o.name}`}>
+                              🧬 {o.name} ({o.count})
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                    </select>
+
+                    {selectedSpecialty !== 'all' && (
+                      <button
+                        id="clear-specialty-filter-btn"
+                        type="button"
+                        onClick={() => { setSelectedSpecialty('all'); setCurrentPage(1); }}
+                        className="inline-flex items-center gap-1 text-[11px] bg-sky-100 hover:bg-sky-200 text-sky-800 border border-sky-300 px-2 py-1 rounded-md font-medium transition-colors cursor-pointer"
+                        title="Bỏ lọc chuyên khoa này, quay về hiển thị tất cả kỹ thuật"
+                      >
+                        <span className="max-w-[110px] truncate">{activeSpecialtyLabel}</span>
+                        <X className="w-3 h-3 text-sky-700 shrink-0" />
+                      </button>
+                    )}
+                  </div>
 
                   <div className="relative flex-1 sm:flex-initial">
                     <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
@@ -1174,9 +1606,15 @@ export default function App() {
                       type="text"
                       value={searchFilter}
                       onChange={(e) => { setSearchFilter(e.target.value); setCurrentPage(1); }}
-                      placeholder="Tìm tên, mã, bộ phận..."
-                      className="pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-sky-500 w-full sm:w-52"
+                      placeholder="Tìm tên, mã, bộ phận... (/)"
+                      title="Tìm kiếm danh mục kỹ thuật (Phím tắt: / hoặc Ctrl+F)"
+                      className="pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-sky-500 w-full sm:w-56"
                     />
+                    {!searchFilter && (
+                      <kbd className="hidden sm:inline-block absolute right-2.5 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-mono text-slate-400 bg-slate-200/70 border border-slate-300 rounded pointer-events-none">
+                        /
+                      </kbd>
+                    )}
                   </div>
 
                   <select
@@ -1292,16 +1730,26 @@ export default function App() {
                                   {(row.chuyenKhoaGoc || row.boPhanGoc) && (
                                     <div className="mt-1 flex items-center gap-1.5 flex-wrap">
                                       {row.chuyenKhoaGoc && (
-                                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-700 font-medium border border-slate-200">
-                                          <Stethoscope className="w-2.5 h-2.5 text-sky-600" />
-                                          {row.chuyenKhoaGoc}
-                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => { setSelectedSpecialty(row.chuyenKhoaGoc!); setCurrentPage(1); }}
+                                          title={`Nhấp để lọc nhanh theo loại danh mục / chuyên khoa: ${row.chuyenKhoaGoc}`}
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 hover:bg-sky-100 hover:text-sky-800 text-slate-700 font-medium border border-slate-200 transition-colors cursor-pointer text-left"
+                                        >
+                                          <Stethoscope className="w-2.5 h-2.5 text-sky-600 shrink-0" />
+                                          <span>{row.chuyenKhoaGoc}</span>
+                                        </button>
                                       )}
                                       {row.boPhanGoc && (
-                                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-sky-50 text-sky-800 font-medium border border-sky-200">
-                                          <Activity className="w-2.5 h-2.5 text-sky-600" />
-                                          {row.boPhanGoc}
-                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => { setSearchFilter(row.boPhanGoc!); setCurrentPage(1); }}
+                                          title={`Nhấp để tìm kiếm nhanh theo giải phẫu: ${row.boPhanGoc}`}
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-sky-50 hover:bg-sky-100 text-sky-800 font-medium border border-sky-200 transition-colors cursor-pointer text-left"
+                                        >
+                                          <Activity className="w-2.5 h-2.5 text-sky-600 shrink-0" />
+                                          <span>{row.boPhanGoc}</span>
+                                        </button>
                                       )}
                                     </div>
                                   )}
@@ -1619,13 +2067,52 @@ export default function App() {
         onDismissWarning={handleDismissWarning}
       />
 
+      {/* Bảng Tra Cứu Phím Tắt Toàn Cục Tăng Tốc Thao Tác Cán Bộ Y Tế */}
+      <KeyboardShortcutsModal
+        isOpen={isShortcutsModalOpen}
+        onClose={() => setIsShortcutsModalOpen(false)}
+      />
+
+      {/* Thông Báo Trực Quan Khi Kích Hoạt Phím Tắt (Visual Toast) */}
+      {shortcutToast && (
+        <div
+          id="shortcut-toast-notification"
+          className="fixed bottom-5 right-5 z-50 pointer-events-none transition-all duration-300 transform translate-y-0"
+        >
+          <div
+            className={`px-4 py-2.5 rounded-xl shadow-2xl border flex items-center gap-2.5 text-xs font-semibold backdrop-blur-md ${
+              shortcutToast.type === 'success'
+                ? 'bg-slate-900/95 text-emerald-300 border-emerald-500/50 shadow-emerald-950/20'
+                : shortcutToast.type === 'warning'
+                ? 'bg-slate-900/95 text-amber-300 border-amber-500/50 shadow-amber-950/20'
+                : 'bg-slate-900/95 text-sky-200 border-sky-500/50 shadow-sky-950/20'
+            }`}
+          >
+            <Zap className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>{shortcutToast.message}</span>
+          </div>
+        </div>
+      )}
+
       {/* Footer */}
       <footer className="border-t border-slate-200 bg-white py-6 mt-12 text-center text-xs text-slate-500">
-        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <span>
             Hệ Thống Đối Chiếu Danh Mục Kỹ Thuật Y Tế Tự Động • Thông tư 23/2024/TT-BYT
           </span>
-          <div className="flex items-center justify-center gap-4">
+          <div className="flex items-center justify-center flex-wrap gap-4">
+            <button
+              onClick={() => setIsShortcutsModalOpen(true)}
+              className="text-sky-700 hover:text-sky-900 font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+              title="Mở bảng tra cứu phím tắt bàn phím (Phím tắt: ?)"
+            >
+              <Keyboard className="w-3.5 h-3.5 text-sky-600" />
+              <span>Phím tắt</span>
+              <kbd className="px-1.5 py-0.2 rounded bg-slate-100 text-[10px] font-mono text-slate-600 border border-slate-300">
+                ?
+              </kbd>
+            </button>
+            <span>•</span>
             <button
               onClick={() => setIsDeployModalOpen(true)}
               className="text-sky-700 hover:underline font-medium inline-flex items-center gap-1 cursor-pointer"

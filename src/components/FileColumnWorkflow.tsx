@@ -957,6 +957,7 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
                 id="btn-execute-workflow-mapping"
                 disabled={!allFilesUploaded || isProcessing}
                 onClick={onStartMapping}
+                title="Bắt đầu đối chiếu danh mục kỹ thuật (Phím tắt: Ctrl + Enter hoặc Cmd + Enter)"
                 className={`inline-flex items-center gap-2 px-6 py-2.5 text-sm font-bold rounded-lg shadow-sm transition-all ${
                   !allFilesUploaded || isProcessing
                     ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
@@ -964,7 +965,12 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
                 }`}
               >
                 <Play className="w-4 h-4 fill-current" />
-                {isProcessing ? 'Đang Xử Lý Đối Chiếu...' : 'Bắt Đầu Đối Chiếu DMKT & Thẩm Định AI'}
+                <span>{isProcessing ? 'Đang Xử Lý Đối Chiếu...' : 'Bắt Đầu Đối Chiếu DMKT & Thẩm Định AI'}</span>
+                {!isProcessing && allFilesUploaded && (
+                  <kbd className="hidden sm:inline-block px-2 py-0.5 text-xs font-mono font-semibold bg-emerald-800/80 text-emerald-100 rounded border border-emerald-500/40">
+                    Ctrl+Enter
+                  </kbd>
+                )}
               </button>
             </div>
           </div>

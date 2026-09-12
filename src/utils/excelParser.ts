@@ -161,26 +161,165 @@ function findColumnIndexByKeywords(
 }
 
 /**
- * Kiểm tra xem một dòng có phải là tiêu đề phân chương / chuyên khoa hay không
- * Ví dụ: "I. Chương chung", "II. Hồi sức cấp cứu", "Chương 1...", "Phần A..."
+ * Nhận diện dòng tiêu đề Chương / Chuyên khoa / Phân mục trong file Danh mục Kỹ thuật Y tế.
+ * Hỗ trợ các mẫu thực tế theo Thông tư BYT (TT 43/2013, TT 21/2017, TT 32/2023, TT 23/2024) và bệnh viện Việt Nam:
+ * 1. Số La Mã: "IX. Tai mũi họng", "VIII. Răng hàm mặt", "I. Hồi sức cấp cứu", "II - Ngoại khoa", "X: Mắt"
+ * 2. Cột TT chứa số La Mã/Chữ cái: rawTTVal = "IX" | "A", nameVal = "Tai mũi họng"
+ * 3. Tiền tố phân loại: "Chương IX...", "Phần II...", "Chuyên khoa Tai mũi họng", "Khoa...", "Khối...", "Nhóm..."
+ * 4. Chữ cái phân chương: "A. Ngoại khoa", "B. Nội khoa"
+ * 5. Tên chuyên khoa độc lập (khi không có mã kỹ thuật và STT không phải là số chỉ mục kỹ thuật)
  */
-function isChapterHeaderRow(nameVal: string, rawTTVal: string, codeVal: string): boolean {
-  if (!nameVal) return false;
-  const trimmed = nameVal.trim();
+export function detectChapterHeader(
+  nameVal: string,
+  rawTTVal: string,
+  codeVal: string,
+  row?: any[],
+  nameColIdx?: number,
+  codeColIdx?: number,
+  ttColIdx?: number,
+  candidateSTTCols?: number[]
+): string | null {
+  if (!nameVal && !rawTTVal) return null;
 
-  // Dạng số La Mã: "I. ", "II. ", "III. ", "IV. ", ...
-  const isRomanHeading = /^([IVXLCDM]+)\.\s+/i.test(trimmed);
+  const trimmedName = String(nameVal || '').trim();
+  const trimmedTT = String(rawTTVal || '').trim();
+  const trimmedCode = String(codeVal || '').trim();
 
-  // Dạng từ khóa phân loại: "Chương ...", "Phần ...", "Chuyên khoa ...", "Khối ...", "Mục ..."
-  const isNamedSection = /^(chương|chuong|phần|phan|chuyên khoa|chuyen khoa|khối|khoi|nhóm|nhom|mục|muc)\s+([IVXLCDM0-9]+|[a-z]+|\:|\.)/i.test(trimmed);
+  // Nếu có mã kỹ thuật rõ ràng (dạng số hoặc mã thông tư có dấu chấm như 15.302, 1.52, 01.0021...), đây là dòng kỹ thuật, KHÔNG PHẢI tiêu đề chương
+  if (trimmedCode && /[\d\.]/.test(trimmedCode)) {
+    return null;
+  }
 
-  if ((isRomanHeading || isNamedSection) && !codeVal) {
-    if (!rawTTVal || isNaN(Number(rawTTVal))) {
-      return true;
+  // 1. Dòng có số La Mã ở đầu tên: "IX. Tai mũi họng", "VIII. Răng hàm mặt", "I. Hồi sức cấp cứu", "IV - Ngoại khoa", "X: Mắt"
+  const romanNameMatch = trimmedName.match(/^([IVXLCDM]+)[\.\:\-\/\)]\s*(.+)$/i);
+  if (romanNameMatch) {
+    const roman = romanNameMatch[1].toUpperCase();
+    const title = romanNameMatch[2].trim();
+    // Kiểm tra STT không phải là số thứ tự kỹ thuật lớn (ví dụ không phải số đếm 1048)
+    if (!trimmedTT || isNaN(Number(trimmedTT)) || trimmedTT === roman) {
+      return `${roman}. ${title}`;
     }
   }
 
-  return false;
+  // 2. Cột STT chứa số La Mã hoặc chữ cái đại diện chương: rawTTVal = "IX" / "IX." / "A"
+  const romanTTMatch = trimmedTT.match(/^([IVXLCDM]+|[A-Z])[\.\:]?$/i);
+  if (romanTTMatch && trimmedName) {
+    const prefix = romanTTMatch[1].toUpperCase();
+    // Nếu tên kỹ thuật không có mã
+    if (!trimmedCode) {
+      if (trimmedName.toUpperCase().startsWith(`${prefix}.`)) {
+        return trimmedName;
+      }
+      return `${prefix}. ${trimmedName}`;
+    }
+  }
+
+  // 3. Tiền tố phân loại có từ khóa: "Chương ...", "Phần ...", "Chuyên khoa ...", "Khoa ...", "Khối ...", "Nhóm ...", "Mục ..."
+  const namedSectionMatch = trimmedName.match(
+    /^(chương|chuong|phần|phan|chuyên khoa|chuyen khoa|khoa|khối|khoi|nhóm|nhom|mục|muc|tiểu mục|tieu muc)\s*([IVXLCDM0-9]+|[a-z0-9\.\:\-]+)?\s*[\:\.\-\/]?\s*(.+)$/i
+  );
+  if (namedSectionMatch && !trimmedCode) {
+    if (!trimmedTT || isNaN(Number(trimmedTT))) {
+      return trimmedName;
+    }
+  }
+
+  // 4. Ký hiệu chữ cái phân chương: "A. Ngoại khoa", "B. Khám bệnh"
+  const alphaNameMatch = trimmedName.match(/^([A-Z])[\.\:\-]\s+([A-ZÀ-Ỹa-zà-ỹ].+)$/);
+  if (alphaNameMatch && !trimmedCode) {
+    if (!trimmedTT || isNaN(Number(trimmedTT))) {
+      return trimmedName;
+    }
+  }
+
+  // 5. Tên chuyên khoa độc lập in hoa hoặc Title Case khi các cột mã và STT đều trống
+  // (ví dụ ô Excel chỉ ghi "IX. Tai mũi họng" hoặc "TAI MŨI HỌNG", các cột còn lại hoàn toàn để trống)
+  if (!trimmedCode && (!trimmedTT || !isNumericSTT(trimmedTT))) {
+    const cleanLower = trimmedName.toLowerCase().replace(/[\:\.\-]/g, ' ').replace(/\s+/g, ' ').trim();
+    const commonSpecialties = [
+      'tai mũi họng', 'tai mui hong',
+      'răng hàm mặt', 'rang ham mat',
+      'mắt', 'nhãn khoa', 'mat', 'nhan khoa',
+      'ngoại khoa', 'ngoai khoa',
+      'nội khoa', 'noi khoa',
+      'hồi sức cấp cứu', 'hoi suc cap cuu', 'hồi sức tích cực',
+      'gây mê hồi sức', 'gay me hoi suc',
+      'chẩn đoán hình ảnh', 'chan doan hinh anh',
+      'xét nghiệm', 'xet nghiem',
+      'sản phụ khoa', 'san phu khoa', 'phụ sản',
+      'nhi khoa', 'nhi',
+      'y học cổ truyền', 'y hoc co truyen',
+      'phục hồi chức năng', 'phuc hoi chuc nang',
+      'ung bướu', 'ung buou',
+      'da liễu', 'da lieu',
+      'thần kinh', 'than kinh',
+      'tâm thần', 'tam than',
+      'huyết học', 'truyền máu',
+      'thăm dò chức năng',
+      'chuyên khoa khám bệnh', 'khám bệnh',
+    ];
+
+    const isMatchSpecialty = commonSpecialties.some(
+      (spec) => cleanLower === spec || cleanLower.endsWith(spec) || cleanLower.startsWith(spec)
+    );
+
+    if (isMatchSpecialty) {
+      return trimmedName;
+    }
+  }
+
+  // 6. QUY TẮC CỐT LÕI: Loại danh mục nằm cùng cột với danh sách DVKT
+  // nhưng cột STT tương ứng dòng đó thường TRỐNG hoặc KHÔNG PHẢI LÀ SỐ
+  // (ví dụ thực tế trong file Excel bệnh viện: "SAU SINH", "TRƯỚC SINH", "HỒI SỨC TRẺ SƠ SINH", "CHĂM SÓC THIẾT YẾU",...)
+  if (!trimmedCode) {
+    const isSTTBlankOrNotNumeric = !trimmedTT || !isNumericSTT(trimmedTT);
+
+    // Kiểm tra thêm nếu có danh sách các cột STT tiềm năng
+    let hasBlankCandidateSTT = false;
+    if (row && candidateSTTCols && candidateSTTCols.length > 0) {
+      for (const colIdx of candidateSTTCols) {
+        const cell = row[colIdx];
+        if (cell === null || cell === undefined || String(cell).trim() === '' || !isNumericSTT(cell)) {
+          hasBlankCandidateSTT = true;
+          break;
+        }
+      }
+    }
+
+    if (isSTTBlankOrNotNumeric || hasBlankCandidateSTT) {
+      // Kiểm tra xem dòng này có các cột dữ liệu kỹ thuật khác (checkmark 'x', giá, đơn vị...) hay không
+      let isExecutionDataEmpty = true;
+      if (row && typeof nameColIdx === 'number' && nameColIdx >= 0) {
+        const afterNameCells = row.slice(nameColIdx + 1);
+        const nonEmptyAfter = afterNameCells.filter((c: any) => {
+          const s = String(c || '').trim();
+          return s.length > 0;
+        });
+        if (nonEmptyAfter.length > 0) {
+          isExecutionDataEmpty = false;
+        }
+      }
+
+      // Độ dài tên hợp lý của một loại danh mục / phân nhóm (2 đến 120 ký tự)
+      const validLength = trimmedName.length >= 2 && trimmedName.length <= 120;
+      // Dấu hiệu nhận diện: chữ IN HOA (như "SAU SINH", "TRƯỚC SINH") hoặc không có dữ liệu thực hiện
+      const isAllUpper = trimmedName === trimmedName.toUpperCase() && /[A-ZÀ-Ỹ]/.test(trimmedName);
+
+      if (validLength && (isExecutionDataEmpty || isAllUpper || !trimmedTT)) {
+        return trimmedName;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Kiểm tra xem một dòng có phải là tiêu đề phân chương / chuyên khoa hay không
+ * (Hàm tương thích ngược với code cũ)
+ */
+function isChapterHeaderRow(nameVal: string, rawTTVal: string, codeVal: string): boolean {
+  return detectChapterHeader(nameVal, rawTTVal, codeVal) !== null;
 }
 
 /**
@@ -550,20 +689,74 @@ export async function parseSourceFile(file: File, config?: FileMappingConfig): P
         1
       );
 
+  // Tìm tất cả các cột STT tiềm năng (trước cột Tên kỹ thuật)
+  const normHeaders = headers.map(normalizeKeyword);
+  const sttCandidateIndices: number[] = [];
+  for (let c = 0; c < nameIdx; c++) {
+    const h = normHeaders[c] || '';
+    if (
+      h === 'tt' ||
+      h === 'stt' ||
+      h === 'so tt' ||
+      h === 'so thu tu' ||
+      h === 'thu tu' ||
+      h.startsWith('stt') ||
+      h.startsWith('tt ') ||
+      h.includes('so tt') ||
+      isSTTKeyword(headers[c])
+    ) {
+      sttCandidateIndices.push(c);
+    }
+  }
+
   // Tìm cột TT / STT của File Gốc (STT 2)
   let ttIdx = config?.ttColIdx !== undefined && config.ttColIdx >= 0 ? config.ttColIdx : -1;
   if (ttIdx === -1) {
-    const normHeaders = headers.map(normalizeKeyword);
-    ttIdx = normHeaders.findIndex(
-      (h) => h === 'tt' || h === 'stt' || h === 'so tt' || h === 'so thu tu' || h === 'thu tu'
-    );
-    if (ttIdx === -1) {
+    if (sttCandidateIndices.length > 1) {
+      // Ưu tiên cột có từ khóa rõ ràng
+      let chosenIdx = -1;
+      for (const col of sttCandidateIndices) {
+        const h = normHeaders[col] || '';
+        if (h.includes('qd') || h.includes('43') || h.includes('21') || h.includes('23') || h.includes('kt') || h.includes('stt 2')) {
+          chosenIdx = col;
+          break;
+        }
+      }
+
+      // Quét các dòng mẫu để phân biệt cột STT kỹ thuật thực tế (thường bắt đầu > 1 hoặc có ô trống ở dòng loại danh mục)
+      if (chosenIdx === -1) {
+        const secondCandidate = sttCandidateIndices[1];
+        let hasGapsOrHighNumbers = false;
+        const scanLimit = Math.min(headerRowIdx + 25, rawRows.length);
+        for (let r = headerRowIdx + 1; r < scanLimit; r++) {
+          const val = rawRows[r]?.[secondCandidate];
+          if (val === undefined || val === null || String(val).trim() === '') {
+            hasGapsOrHighNumbers = true;
+            break;
+          }
+          const num = Number(val);
+          if (!isNaN(num) && num > 10) {
+            hasGapsOrHighNumbers = true;
+            break;
+          }
+        }
+        chosenIdx = hasGapsOrHighNumbers ? secondCandidate : sttCandidateIndices[0];
+      }
+      ttIdx = chosenIdx;
+    } else if (sttCandidateIndices.length === 1) {
+      ttIdx = sttCandidateIndices[0];
+    } else {
       ttIdx = normHeaders.findIndex(
-        (h) => (h.startsWith('tt ') || h.startsWith('stt ')) && !h.includes('43') && !h.includes('21') && !h.includes('23')
+        (h) => h === 'tt' || h === 'stt' || h === 'so tt' || h === 'so thu tu' || h === 'thu tu'
       );
-    }
-    if (ttIdx === -1 && nameIdx !== 0 && codeIdx !== 0) {
-      ttIdx = 0;
+      if (ttIdx === -1) {
+        ttIdx = normHeaders.findIndex(
+          (h) => (h.startsWith('tt ') || h.startsWith('stt ')) && !h.includes('43') && !h.includes('21') && !h.includes('23')
+        );
+      }
+      if (ttIdx === -1 && nameIdx !== 0 && codeIdx !== 0) {
+        ttIdx = 0;
+      }
     }
   }
 
@@ -574,7 +767,32 @@ export async function parseSourceFile(file: File, config?: FileMappingConfig): P
   }
 
   const items: SourceItem[] = [];
+  let currentMajorChapter = '';
+  let currentSubCategory = '';
   let currentChapter = '';
+
+  // Tự động nhận diện cột Chuyên khoa / Khoa phòng / Phân loại nếu có trong tiêu đề file
+  let specialtyColIdx = normHeaders.findIndex(
+    (h) =>
+      h === 'chuyen khoa' ||
+      h === 'khoa phong' ||
+      h === 'khoa' ||
+      h === 'khoa thuc hien' ||
+      h === 'nhom ky thuat' ||
+      h === 'phan loai' ||
+      h === 'chuyen nganh' ||
+      h === 'he co quan' ||
+      h === 'chuong'
+  );
+  if (specialtyColIdx === -1) {
+    specialtyColIdx = normHeaders.findIndex(
+      (h) =>
+        (h.startsWith('chuyen khoa') || h.startsWith('khoa ') || h.startsWith('nhom ')) &&
+        !h.includes('ten') &&
+        !h.includes('ma') &&
+        !h.includes('stt')
+    );
+  }
 
   for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
     const row = rawRows[r];
@@ -585,9 +803,33 @@ export async function parseSourceFile(file: File, config?: FileMappingConfig): P
 
     if (!nameVal) continue;
 
-    // Nếu là dòng tiêu đề chương / phân khoa thì lưu lại chương hiện tại và bỏ qua, không tính là kỹ thuật
-    if (isChapterHeaderRow(nameVal, rawTTVal, codeVal)) {
-      currentChapter = nameVal;
+    // Nếu là dòng tiêu đề chương / loại danh mục thì lưu lại chương hiện tại và bỏ qua, không tính là kỹ thuật
+    const detectedChapter = detectChapterHeader(
+      nameVal,
+      rawTTVal,
+      codeVal,
+      row,
+      nameIdx,
+      codeIdx,
+      ttIdx,
+      sttCandidateIndices
+    );
+    if (detectedChapter) {
+      const isMajorChapter =
+        /^([IVXLCDM]+)[\.\:\-\/\)]/i.test(detectedChapter) ||
+        /^(chương|chuong|phần|phan|khoa|khối|chuyên khoa)\s+/i.test(detectedChapter);
+
+      if (isMajorChapter) {
+        currentMajorChapter = detectedChapter;
+        currentSubCategory = '';
+      } else {
+        currentSubCategory = detectedChapter;
+      }
+
+      currentChapter = currentMajorChapter && currentSubCategory
+        ? `${currentMajorChapter} > ${currentSubCategory}`
+        : (currentSubCategory || currentMajorChapter || detectedChapter);
+
       continue;
     }
 
@@ -600,12 +842,20 @@ export async function parseSourceFile(file: File, config?: FileMappingConfig): P
       parsedStt2 = items.length + 1;
     }
 
+    // Trích xuất chuyên khoa từ cột chuyên biệt nếu có trong dòng
+    let rowSpecialty = '';
+    if (specialtyColIdx !== -1 && row[specialtyColIdx] !== undefined && row[specialtyColIdx] !== null) {
+      rowSpecialty = String(row[specialtyColIdx]).trim();
+    }
+
+    const finalChapter = rowSpecialty || currentChapter || undefined;
+
     items.push({
       id: items.length + 1, // STT 1: Tăng dần liên tục cộng dồn từ 1 đến N
       stt2: parsedStt2,      // STT 2: Chính xác hoàn toàn theo file danh mục gốc
       name: nameVal,
       code: codeVal,
-      chapter: currentChapter || undefined,
+      chapter: finalChapter,
       rawRow: row,
     });
   }
@@ -680,6 +930,9 @@ export async function parsePL1File(file: File, config?: FileMappingConfig): Prom
     const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim() : '';
 
     if (nameVal) {
+      if (detectChapterHeader(nameVal, '', codeVal, row, nameIdx, codeIdx)) {
+        continue;
+      }
       items.push({
         name: nameVal,
         code: codeVal,
@@ -759,6 +1012,9 @@ export async function parsePL2File(file: File, config?: FileMappingConfig): Prom
     const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim() : '';
 
     if (nameVal) {
+      if (detectChapterHeader(nameVal, '', codeVal, row, nameIdx, codeIdx)) {
+        continue;
+      }
       items.push({
         name: nameVal,
         code: codeVal,
