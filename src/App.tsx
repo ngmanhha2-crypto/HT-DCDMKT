@@ -803,9 +803,14 @@ export default function App() {
                   Chỉ Mục Đảo Siêu Tốc • Sẵn sàng cho File Nhiều Dòng
                 </span>
               </div>
-              <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-white">
-                Hệ Thống Đối Chiếu Danh Mục Kỹ Thuật Y Tế Tự Động (Fuzzy Matching)
-              </h1>
+              <div className="flex items-center gap-3">
+                <div className="p-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 shrink-0 shadow-inner">
+                  <img src="/favicon.svg" alt="Biểu tượng Y tế" className="w-8 h-8 rounded-lg shadow-sm" />
+                </div>
+                <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-white">
+                  Hệ Thống Đối Chiếu Danh Mục Kỹ Thuật Y Tế Tự Động (Fuzzy Matching)
+                </h1>
+              </div>
               <p className="text-xs sm:text-sm text-slate-300 max-w-3xl leading-relaxed">
                 Tự động đối chiếu mờ từ <span className="text-white font-semibold">File gốc</span> sang{' '}
                 <span className="text-sky-300 font-semibold">Phụ lục 1</span> và{' '}
