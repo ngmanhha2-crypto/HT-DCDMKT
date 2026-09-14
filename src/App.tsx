@@ -1191,7 +1191,7 @@ export default function App() {
               <p className="text-xs sm:text-sm text-slate-300 max-w-3xl leading-relaxed">
                 Tự động đối chiếu mờ từ <span className="text-white font-semibold">File gốc</span> sang{' '}
                 <span className="text-sky-300 font-semibold">Phụ lục 1</span> và{' '}
-                <span className="text-cyan-300 font-semibold">Phụ lục 2</span>. Tối ưu bộ nhớ đệm, chạy mượt mà trên GitHub và Vercel Edge.
+                <span className="text-cyan-300 font-semibold">Phụ lục 2</span> theo Thông tư 23/2024/TT-BYT.
               </p>
             </div>
 
