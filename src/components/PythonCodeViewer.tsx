@@ -98,9 +98,59 @@ ANATOMY_ONTOLOGY = {
     }
 }
 
+# Từ điển chuẩn hóa viết tắt lâm sàng y tế Việt Nam (Medical Abbreviation & Synonym Normalizer)
+MEDICAL_ABBREVIATIONS = {
+    'pt': 'phẫu thuật',
+    'tt': 'thủ thuật',
+    'ns': 'nội soi',
+    'sa': 'siêu âm',
+    'ct': 'cắt lớp vi tính',
+    'clvt': 'cắt lớp vi tính',
+    'mri': 'cộng hưởng từ',
+    'cht': 'cộng hưởng từ',
+    'xq': 'x quang',
+    'xquang': 'x quang',
+    'ecg': 'điện tâm đồ',
+    'eeg': 'điện não đồ',
+    'emg': 'điện cơ',
+    'tlt': 'tiền liệt tuyến',
+    'ctc': 'cổ tử cung',
+    'tc': 'tử cung',
+    'nkq': 'nội khí quản',
+    'mkq': 'mở khí quản',
+    'đm': 'động mạch',
+    'tm': 'tĩnh mạch',
+    'cvc': 'catheter tĩnh mạch trung tâm',
+    'đh': 'đường huyết',
+    'kpb': 'không phân biệt',
+    'khx': 'kết hợp xương',
+    'rhm': 'răng hàm mặt',
+    'tmh': 'tai mũi họng',
+    'tpt': 'tổng phân tích'
+}
+
+COMPOUND_REPLACEMENTS = [
+    (r'(?i)\bđm/tm\b|\bđm-tm\b', 'động mạch và tĩnh mạch'),
+    (r'(?i)\bpt\s+ns\b', 'phẫu thuật nội soi'),
+    (r'(?i)\bpt\s+mở\b', 'phẫu thuật mở'),
+    (r'(?i)\bcắt\s+tlt\s+ns\b', 'phẫu thuật nội soi cắt đốt u tiền liệt tuyến'),
+    (r'(?i)\bcắt\s+u\s+xơ\s+tc\b', 'phẫu thuật cắt u xơ tử cung'),
+    (r'(?i)\bchụp\s+ct\b|\bchụp\s+clvt\b', 'chụp cắt lớp vi tính'),
+    (r'(?i)\bchụp\s+mri\b', 'chụp cộng hưởng từ'),
+    (r'(?i)\bđo\s+ecg\b', 'đo điện tâm đồ'),
+    (r'(?i)\bđo\s+đh\b', 'đo đường huyết'),
+    (r'(?i)\bmổ\s+đẻ\b|\bmo\s+de\b|\bmổ\s+lấy\s+thai\b', 'phẫu thuật lấy thai'),
+    (r'(?i)\bphaco\b', 'tán nhuyễn thể thủy tinh bằng siêu âm phaco'),
+    (r'(?i)\bnạo\s+va\b', 'nạo sùi vòm họng va'),
+    (r'(?i)\bcắt\s+amidan\b|\bcắt\s+a\b', 'phẫu thuật cắt amidan'),
+    (r'(?i)\bu\s+xơ\s+(?:tuyến\s+)?tiền\s+liệt\b', 'u phì đại lành tính tuyến tiền liệt')
+]
+
 def clean_text(text: any) -> str:
     \"\"\"
     Tiền xử lý chuỗi danh mục kỹ thuật y tế:
+    - Chuẩn hóa toàn bộ từ viết tắt lâm sàng (PT, TT, NS, SA, CT, MRI, TLT, CTC, ĐM/TM...)
+    - Ánh xạ từ đồng nghĩa lâm sàng chuyên khoa
     - Chuyển thành chữ thường (lowercase)
     - Xóa các ký tự đặc biệt gây nhiễu thường gặp trong y tế: *, +, -, ,, ., v.v.
     - Loại bỏ khoảng trắng thừa đầu, cuối và giữa các từ.
@@ -108,11 +158,30 @@ def clean_text(text: any) -> str:
     if pd.isna(text):
         return ""
     text_str = str(text).lower()
-    # Loại bỏ các ký tự đặc biệt thường gặp: *, +, -, ,, ., [, ], (, ), :, ;, /, \\
-    text_str = re.sub(r"[\\*\\+\\-\\,\\.\\[\\]\\(\\)\\:\\;\\/\\\\_\\"']", " ", text_str)
-    # Gom các khoảng trắng thừa liên tiếp thành 1 dấu cách duy nhất và strip
-    text_str = re.sub(r"\\s+", " ", text_str).strip()
-    return text_str
+    # Loại bỏ ký tự đặc biệt gây nhiễu nhưng giữ gạch chéo để xử lý ĐM/TM
+    text_str = re.sub(r"[\\*\\+\\-\\,\\.\\[\\]\\(\\)\\:\\;\\\\_\\"']", " ", text_str)
+
+    # Thay thế hợp ngữ ưu tiên
+    for pattern, rep in COMPOUND_REPLACEMENTS:
+        text_str = re.sub(pattern, rep, text_str)
+
+    text_str = text_str.replace('/', ' ')
+
+    # Chuẩn hóa từng token viết tắt
+    tokens = text_str.split()
+    normalized = []
+    for i, token in enumerate(tokens):
+        # Ngoại lệ ngữ cảnh "sa" đi kèm sa tử cung/sa trực tràng
+        if token == 'sa' and i + 1 < len(tokens) and tokens[i + 1] in ['tử', 'sinh', 'trực', 'thành']:
+            normalized.append('sa')
+        elif token in MEDICAL_ABBREVIATIONS:
+            normalized.append(MEDICAL_ABBREVIATIONS[token])
+        else:
+            normalized.append(token)
+
+    res = " ".join(normalized)
+    res = re.sub(r"\\s+", " ", res).strip()
+    return res
 
 
 def decompose_medical_procedure(name: str) -> dict:

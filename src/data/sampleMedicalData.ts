@@ -98,6 +98,11 @@ export const RAW_SAMPLE_SOURCE = [
     name: "Xử trí vết rách cổ tử cung đơn thuần *",
     chapter: "III. Sản - Phụ khoa",
   },
+  {
+    code: "15.0023.0043",
+    name: "Bóp bóng ambu qua mặt nạ",
+    chapter: "II. Chuyên khoa Ngoại & Hồi sức",
+  },
 ];
 
 // Dữ liệu mẫu Phụ lục 1 - TT 23/2024/TT-BYT (skiprows=3)
@@ -166,6 +171,10 @@ export const RAW_SAMPLE_PL1 = [
     code: "23.PL1.01570",
     name: "Xử trí vết rách cổ tử cung",
   },
+  {
+    code: "23.PL1.01680",
+    name: "Bóp bóng ambu qua mặt nạ",
+  },
 ];
 
 // Dữ liệu mẫu Phụ lục 2 - TT 23/2024/TT-BYT (skiprows=1)
@@ -233,6 +242,18 @@ export const RAW_SAMPLE_PL2 = [
   {
     code: "23.PL2.0016",
     name: "Xử trí vết rách cổ tử cung đơn thuần",
+  },
+  {
+    code: "23.PL2.0025",
+    name: "Bóp bóng Ambu",
+  },
+  {
+    code: "23.PL2.0026",
+    name: "Bóp bóng Ambu qua mặt nạ trẻ sơ sinh",
+  },
+  {
+    code: "23.PL2.0027",
+    name: "Thông khí nhân tạo bằng bóp bóng Ambu",
   },
 ];
 

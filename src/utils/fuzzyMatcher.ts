@@ -7,21 +7,43 @@ import {
   ANATOMY_ONTOLOGY,
   ACTION_MODALITY_INFO,
 } from './anatomyMatcher';
+import {
+  normalizeMedicalAbbreviations,
+  getMedicalAbbreviationInfo,
+  MEDICAL_ABBREVIATIONS_MAP,
+} from './medicalDictionary';
+
+export {
+  normalizeMedicalAbbreviations,
+  getMedicalAbbreviationInfo,
+  MEDICAL_ABBREVIATIONS_MAP,
+};
 
 /**
  * Tiền xử lý chuỗi danh mục kỹ thuật y tế:
+ * - Chuẩn hóa toàn bộ từ viết tắt lâm sàng (PT, TT, NS, SA, CT, MRI, TLT, CTC, ĐM/TM...)
+ * - Nhận diện ngữ cảnh và đồng bộ từ đồng nghĩa y tế
  * - Chuyển thành chữ thường (lowercase)
- * - Xóa bỏ các ký tự đặc biệt nhiễu thường gặp trong ngành y: *, +, -, ,, ., v.v.
+ * - Xóa bỏ các ký tự đặc biệt nhiễu y tế (*, +, -, ,, ., v.v.)
  * - Loại bỏ các khoảng trắng thừa ở đầu, cuối và giữa các từ.
  */
 export function cleanText(text: string | null | undefined): string {
   if (!text) return '';
-  let str = String(text).toLowerCase();
-  // Xóa các ký tự đặc biệt nhiễu y tế: *, +, -, ,, ., v.v.
-  str = str.replace(/[*+\-,.\[\]():;\/\\_"'`~!?@#$%^&=]/g, ' ');
-  // Gộp khoảng trắng thừa
-  str = str.replace(/\s+/g, ' ').trim();
-  return str;
+  return normalizeMedicalAbbreviations(text).normalize('NFC').trim();
+}
+
+/**
+ * Loại bỏ dấu tiếng Việt (Unaccented Vietnamese text normalizer)
+ * Hỗ trợ tra cứu tìm kiếm khi người dùng gõ không dấu hoặc IME tổ hợp NFD
+ */
+export function removeVietnameseTones(str: string | null | undefined): string {
+  if (!str) return '';
+  return str
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .normalize('NFC');
 }
 
 /**
@@ -636,5 +658,306 @@ export function getBestMatch(
   }
 
   return { name: '', code: '', score: 0, matchedItem: null };
+}
+
+export interface CandidateMatchResult {
+  item: TargetItem;
+  code: string;
+  name: string;
+  score: number;
+  anatomy?: string;
+  specialty?: string;
+  matchType: 'EXACT' | 'PREFIX' | 'SUBSTRING' | 'ALL_WORDS' | 'FUZZY' | 'CODE';
+}
+
+export interface FastSearchTargetItem {
+  item: TargetItem;
+  code: string;
+  lowerCode: string;
+  name: string;
+  lowerName: string;
+  unaccentedName: string;
+  cleanName: string;
+  unaccentedClean: string;
+  tokens: string[];
+  unaccentedTokens: string[];
+  comp?: MedicalComponent;
+}
+
+// Bộ nhớ đệm chỉ mục tìm kiếm siêu tốc theo mảng TargetItem[]
+const fastIndexCache = new WeakMap<TargetItem[], FastSearchTargetItem[]>();
+
+export function getOrCreateFastSearchIndex(items: TargetItem[]): FastSearchTargetItem[] {
+  if (!items || items.length === 0) return [];
+  const cached = fastIndexCache.get(items);
+  if (cached) return cached;
+
+  const indexed: FastSearchTargetItem[] = new Array(items.length);
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const code = (it.code || '').trim().normalize('NFC');
+    const lowerCode = code.toLowerCase();
+
+    const name = (it.name || '').trim().normalize('NFC');
+    const lowerName = name.toLowerCase();
+    const unaccentedName = removeVietnameseTones(lowerName);
+
+    const clean = (it.cleanName || cleanText(name)).toLowerCase().normalize('NFC');
+    const unaccentedClean = removeVietnameseTones(clean);
+
+    const tokens = clean.split(/\s+/).filter(Boolean);
+    const unaccentedTokens = unaccentedClean.split(/\s+/).filter(Boolean);
+
+    indexed[i] = {
+      item: it,
+      code,
+      lowerCode,
+      name,
+      lowerName,
+      unaccentedName,
+      cleanName: clean,
+      unaccentedClean,
+      tokens,
+      unaccentedTokens,
+      comp: it.component,
+    };
+  }
+
+  fastIndexCache.set(items, indexed);
+  return indexed;
+}
+
+/**
+ * Tìm kiếm mờ thông minh danh sách ứng viên tốt nhất (Top Fuzzy Matches) phục vụ Autocomplete trực tiếp trên bảng.
+ * Áp dụng chỉ mục đệm trước (FastSearchTargetItem) và thuật toán đa tầng chấm điểm chuẩn hóa tiếng Việt:
+ * 1. Khớp mã kỹ thuật (Code exact/prefix)
+ * 2. Khớp chuỗi chính xác / Tiền tố cụm từ (Exact phrase / Prefix match - VD: "Băng ép")
+ * 3. Khớp chuỗi con đầy đủ (Full Substring match)
+ * 4. Khớp toàn bộ tập từ khóa (Full Keyword Intersection - AND logic, thưởng thứ tự từ)
+ * 5. Phạt nặng các mục thiếu từ khóa tìm kiếm (tránh trường hợp gõ "Băng ép" mà "Thay băng" lại vượt lên trước)
+ * 6. Hỗ trợ gõ không dấu / lỗi gõ bàn phím Telex
+ */
+export function searchTopFuzzyMatches(
+  query: string,
+  items: TargetItem[],
+  limit: number = 15
+): CandidateMatchResult[] {
+  if (!items || items.length === 0) return [];
+  const rawQ = (query || '').trim().normalize('NFC');
+  if (!rawQ) {
+    return items.slice(0, limit).map((item) => {
+      const comp = item.component || decomposeMedicalProcedure(item.name);
+      return {
+        item,
+        code: item.code,
+        name: item.name,
+        score: 100,
+        anatomy: comp.anatomyList.join(', '),
+        specialty: comp.primaryCategory ? ANATOMY_ONTOLOGY[comp.primaryCategory]?.name : undefined,
+        matchType: 'EXACT',
+      };
+    });
+  }
+
+  // Tận dụng chỉ mục tìm kiếm siêu tốc (pre-computed index cache)
+  const indexedList = getOrCreateFastSearchIndex(items);
+
+  // Chuẩn hóa câu truy vấn: Có dấu, Không dấu, Mở rộng viết tắt
+  const lowerQ = rawQ.toLowerCase().normalize('NFC');
+  const unaccentedQ = removeVietnameseTones(lowerQ);
+
+  const cleanQ = cleanText(rawQ).toLowerCase().normalize('NFC');
+  const unaccentedCleanQ = removeVietnameseTones(cleanQ);
+
+  // Danh sách từ khóa người dùng gõ
+  const qTokens = lowerQ.split(/\s+/).filter(Boolean);
+  const qCleanTokens = cleanQ.split(/\s+/).filter(Boolean);
+  const qUnaccentedTokens = unaccentedQ.split(/\s+/).filter(Boolean);
+  const activeTokens = qCleanTokens.length > 0 ? qCleanTokens : qTokens;
+
+  // Lọc nhanh theo từ khóa đầu tiên để tăng tốc tối đa khi dữ liệu lớn (> 10.000 dòng)
+  const firstWord = activeTokens[0] || lowerQ;
+  const firstUnaccented = qUnaccentedTokens[0] || unaccentedQ;
+  const requireFirstWordCheck = firstWord.length >= 3 && activeTokens.length >= 2;
+
+  const scoredResults: {
+    item: TargetItem;
+    score: number;
+    matchType: 'EXACT' | 'PREFIX' | 'SUBSTRING' | 'ALL_WORDS' | 'FUZZY' | 'CODE';
+    comp?: MedicalComponent;
+  }[] = [];
+
+  for (let i = 0; i < indexedList.length; i++) {
+    const entry = indexedList[i];
+    const {
+      lowerCode,
+      lowerName,
+      unaccentedName,
+      cleanName: targetClean,
+      unaccentedClean: unaccentedTargetClean,
+      tokens: targetTokens,
+      unaccentedTokens: targetUnaccentedTokens,
+    } = entry;
+
+    // Tối ưu tốc độ: Bỏ qua các mục hoàn toàn không chứa từ khóa đầu tiên khi truy vấn dài
+    if (requireFirstWordCheck) {
+      if (
+        !lowerName.includes(firstWord) &&
+        !unaccentedName.includes(firstUnaccented) &&
+        !lowerCode.includes(lowerQ)
+      ) {
+        continue;
+      }
+    }
+
+    let score = 0;
+    let matchType: 'EXACT' | 'PREFIX' | 'SUBSTRING' | 'ALL_WORDS' | 'FUZZY' | 'CODE' = 'FUZZY';
+
+    // 1. So khớp mã kỹ thuật (Code Match)
+    if (lowerCode) {
+      if (lowerCode === lowerQ) {
+        score = 100;
+        matchType = 'CODE';
+      } else if (lowerCode.startsWith(lowerQ)) {
+        score = 98;
+        matchType = 'CODE';
+      } else if (lowerCode.includes(lowerQ)) {
+        score = 92;
+        matchType = 'CODE';
+      }
+    }
+
+    // 2. So khớp cụm từ chính xác & tiền tố chuỗi (Exact Phrase & Prefix Match)
+    if (score < 99) {
+      // 2.1 Trùng khớp tuyệt đối
+      if (lowerName === lowerQ || targetClean === cleanQ) {
+        score = 100;
+        matchType = 'EXACT';
+      } else if (unaccentedName === unaccentedQ || unaccentedTargetClean === unaccentedCleanQ) {
+        score = 99;
+        matchType = 'EXACT';
+      }
+      // 2.2 Tên kỹ thuật BẮT ĐẦU bằng cụm từ tìm kiếm (VD: "Băng ép bất động..." bắt đầu bằng "Băng ép")
+      else if (lowerName.startsWith(lowerQ) || targetClean.startsWith(cleanQ)) {
+        const lenRatio = cleanQ.length / Math.max(1, targetClean.length);
+        score = Math.max(score, 95 + 4 * lenRatio);
+        matchType = 'PREFIX';
+      } else if (unaccentedName.startsWith(unaccentedQ) || unaccentedTargetClean.startsWith(unaccentedCleanQ)) {
+        const lenRatio = unaccentedCleanQ.length / Math.max(1, unaccentedTargetClean.length);
+        score = Math.max(score, 93 + 4 * lenRatio);
+        matchType = 'PREFIX';
+      }
+      // 2.3 Tên kỹ thuật CHỨA trọn vẹn cụm từ tìm kiếm (Full Substring)
+      else if (lowerName.includes(lowerQ) || targetClean.includes(cleanQ)) {
+        const lenRatio = cleanQ.length / Math.max(1, targetClean.length);
+        score = Math.max(score, 90 + 5 * lenRatio);
+        matchType = 'SUBSTRING';
+      } else if (unaccentedName.includes(unaccentedQ) || unaccentedTargetClean.includes(unaccentedCleanQ)) {
+        const lenRatio = unaccentedCleanQ.length / Math.max(1, unaccentedTargetClean.length);
+        score = Math.max(score, 86 + 5 * lenRatio);
+        matchType = 'SUBSTRING';
+      }
+      // 3. So khớp đa từ khóa (Multi-token Keyword Matching)
+      else {
+        let matchedQueryWords = 0;
+        let lastFoundIndex = -1;
+        let inConsecutiveOrder = true;
+
+        for (let t = 0; t < activeTokens.length; t++) {
+          const qWord = activeTokens[t];
+          const qUnaccentedWord = qUnaccentedTokens[t] || removeVietnameseTones(qWord);
+
+          let foundThisWord = false;
+          let foundIndex = -1;
+
+          for (let k = 0; k < targetTokens.length; k++) {
+            const tw = targetTokens[k];
+            const tuw = targetUnaccentedTokens[k] || '';
+
+            // Khớp chính xác từ hoặc từ mục tiêu bắt đầu bằng từ khóa
+            if (tw === qWord || (qWord.length >= 2 && tw.startsWith(qWord))) {
+              foundThisWord = true;
+              foundIndex = k;
+              break;
+            }
+            if (tuw === qUnaccentedWord || (qUnaccentedWord.length >= 2 && tuw.startsWith(qUnaccentedWord))) {
+              foundThisWord = true;
+              foundIndex = k;
+              break;
+            }
+          }
+
+          if (foundThisWord) {
+            matchedQueryWords++;
+            if (foundIndex < lastFoundIndex) {
+              inConsecutiveOrder = false;
+            }
+            lastFoundIndex = foundIndex;
+          }
+        }
+
+        const coverage = activeTokens.length > 0 ? matchedQueryWords / activeTokens.length : 0;
+
+        if (activeTokens.length >= 2) {
+          if (coverage >= 1.0) {
+            // Khớp TẤT CẢ các từ người dùng tìm kiếm!
+            const orderBonus = inConsecutiveOrder ? 4 : 0;
+            const lenRatio = cleanQ.length / Math.max(1, targetClean.length);
+            score = Math.max(score, 84 + orderBonus + 4 * lenRatio);
+            matchType = 'ALL_WORDS';
+          } else if (coverage >= 0.5) {
+            // Chỉ khớp MỘT PHẦN từ khóa (VD gõ "băng ép" mà chỉ có "băng")
+            // Áp dụng mức điểm trần tối đa 35% để KHÔNG BAO GIỜ chen ngang các mục khớp đầy đủ
+            score = Math.max(score, 35 * coverage);
+          }
+        } else if (activeTokens.length === 1) {
+          if (coverage >= 1.0) {
+            const lenRatio = cleanQ.length / Math.max(1, targetClean.length);
+            score = Math.max(score, 80 + 8 * lenRatio);
+            matchType = 'SUBSTRING';
+          }
+        }
+
+        // 4. Bổ trợ bằng SequenceMatcher khi chuỗi ngắn hoặc có khả năng gõ sai chính tả
+        if (score < 40 && cleanQ.length >= 4 && targetClean.length <= cleanQ.length * 2.2) {
+          const seq = sequenceMatcherRatio(cleanQ, targetClean);
+          if (seq >= 0.6) {
+            score = Math.max(score, seq * 50);
+          }
+        }
+      }
+    }
+
+    // Lấy những ứng viên có điểm số tiềm năng >= 25% hoặc khớp mã
+    if (score >= 25 || matchType === 'CODE') {
+      scoredResults.push({
+        item: entry.item,
+        score: Math.round(score * 10) / 10,
+        matchType,
+        comp: entry.comp,
+      });
+    }
+  }
+
+  // Sắp xếp giảm dần theo điểm số, nếu bằng điểm thì ưu tiên tên ngắn hơn
+  scoredResults.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.item.name.length - b.item.name.length;
+  });
+
+  const topResults = scoredResults.slice(0, limit);
+
+  return topResults.map((res) => {
+    const comp = res.comp || res.item.component || decomposeMedicalProcedure(res.item.name);
+    return {
+      item: res.item,
+      code: res.item.code,
+      name: res.item.name,
+      score: res.score,
+      anatomy: comp.anatomyList.join(', '),
+      specialty: comp.primaryCategory ? ANATOMY_ONTOLOGY[comp.primaryCategory]?.name : undefined,
+      matchType: res.matchType,
+    };
+  });
 }
 

@@ -45,6 +45,11 @@ const SHORTCUTS: {
         tag: 'Phổ biến',
       },
       {
+        keys: ['Alt', 'M'],
+        description: 'Mở Quản lý các phiên lưu trữ IndexedDB (Lưu bản chụp snapshot, khôi phục phiên)',
+        tag: 'Bảo vệ dữ liệu',
+      },
+      {
         keys: ['Alt', 'S'],
         description: 'Nạp nhanh bộ dữ liệu mẫu 12 kỹ thuật thực tế để thử nghiệm ngay',
       },

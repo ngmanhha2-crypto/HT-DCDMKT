@@ -8,6 +8,8 @@
  * 5. Các từ bổ trợ / trạng từ (Modifiers: liên tục, tại giường, cấp cứu, thường quy...)
  */
 
+import { normalizeMedicalAbbreviations } from './medicalDictionary';
+
 export type ActionModality =
   | 'THU_THUAT_CAN_THIEP'    // Đặt/rút ống thông, catheter, sonde, chọc hút, rửa, bơm, thụt tháo, tiêm truyền...
   | 'XET_NGHIEM_DO_LUONG'    // Đo chỉ số, định lượng, định tính, xét nghiệm sinh hóa, huyết học, test nhanh...
@@ -97,7 +99,8 @@ export const ANATOMY_ONTOLOGY: Record<string, { name: string; terms: string[] }>
       'catheter tĩnh mạch', 'catheter tinh mach', 'tĩnh mạch ngoại vi', 'tinh mach ngoai vi',
       'catheter tĩnh mạch trung tâm', 'catheter tinh mach trung tam', 'cvc', 'picc', 'đặt cvl',
       'catheter luồn', 'ong luon tinh mach',
-      'ống nội khí quản', 'ong noi khi quan', 'canun mở khí quản', 'canun mo khi quan', 'canule',
+      'ống nội khí quản', 'ong noi khi quan', 'canun mở khí quản', 'canun mo khi quan', 'canun', 'canule',
+      'mở khí quản', 'mo khi quan', 'chăm sóc canun', 'chăm sóc người bệnh mở khí quản',
       'hút đờm', 'hut dom', 'hút thông đường thở', 'hut thong duong tho', 'hút dịch khí phế quản',
       'vỗ rung', 'vo rung', 'vỗ rung lồng ngực',
       'thay băng', 'thay bang', 'cắt chỉ', 'cat chi', 'chăm sóc vết mổ', 'cham soc vet mo',
@@ -438,10 +441,8 @@ export function decomposeMedicalProcedure(text: string): MedicalComponent {
     };
   }
 
-  // Chuẩn hóa chuỗi cơ bản
-  let clean = String(text).toLowerCase();
-  clean = clean.replace(/[*+\-,.\[\]():;\/\\_"'`~!?@#$%^&=]/g, ' ');
-  clean = clean.replace(/\s+/g, ' ').trim();
+  // Chuẩn hóa chuỗi y tế & mở rộng toàn diện từ viết tắt lâm sàng
+  const clean = normalizeMedicalAbbreviations(text);
 
   // 1. Quét tìm các từ bổ trợ / trạng từ (Modifiers)
   const detectedModifiers: string[] = [];
@@ -488,9 +489,25 @@ export function decomposeMedicalProcedure(text: string): MedicalComponent {
   }
 
   // 4. Nhận diện Nhóm Hành Động (Action Modality)
+  const isImagingContext = /(?:chụp|chup|siêu âm|sieu am|cắt lớp|cat lop|cộng hưởng từ|cong huong tu|x quang|xquang|xạ hình|xa hinh|spect|pet)/i.test(clean);
   const detectedModalities: ActionModality[] = [];
+
   for (const modItem of ACTION_MODALITY_PATTERNS) {
     for (const pat of modItem.patterns) {
+      // Bỏ qua "cắt" phẫu thuật nếu đây là "cắt lớp" (CĐHA) hoặc "cắt chỉ" (điều dưỡng)
+      if (modItem.modality === 'PHAU_THUAT_XAM_LAN' && (pat === 'cắt' || pat === 'cat')) {
+        if (/(?:cắt lớp|cat lop|cắt chỉ|cat chi)/i.test(clean)) {
+          continue;
+        }
+      }
+
+      // Bỏ qua "tiêm" nếu đây là tiêm thuốc cản quang trong chẩn đoán hình ảnh
+      if (modItem.modality === 'THU_THUAT_CAN_THIEP' && (pat === 'tiêm' || pat === 'tiem')) {
+        if (/(?:cản quang|can quang|đối quang|doi quang)/i.test(clean)) {
+          continue;
+        }
+      }
+
       const regex = new RegExp(`(^|\\s)${pat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i');
       if (regex.test(clean)) {
         if (!detectedModalities.includes(modItem.modality)) {
@@ -501,9 +518,16 @@ export function decomposeMedicalProcedure(text: string): MedicalComponent {
     }
   }
 
+  // Nếu chứa ngữ cảnh CĐHA rõ rệt, bảo đảm CHAN_DOAN_HINH_ANH được ghi nhận
+  if (isImagingContext && !detectedModalities.includes('CHAN_DOAN_HINH_ANH')) {
+    detectedModalities.push('CHAN_DOAN_HINH_ANH');
+  }
+
   // Xác định Nhóm Hành Động Chủ Đạo (Primary Modality) theo thứ tự ưu tiên
   let primaryModality: ActionModality | null = null;
-  if (detectedModalities.length > 0) {
+  if (isImagingContext) {
+    primaryModality = 'CHAN_DOAN_HINH_ANH';
+  } else if (detectedModalities.length > 0) {
     // Sắp xếp theo thứ tự ưu tiên trong ACTION_MODALITY_INFO
     primaryModality = [...detectedModalities].sort(
       (a, b) => ACTION_MODALITY_INFO[a].priority - ACTION_MODALITY_INFO[b].priority

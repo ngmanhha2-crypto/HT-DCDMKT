@@ -797,9 +797,9 @@ export async function parseSourceFile(file: File, config?: FileMappingConfig): P
   for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
     const row = rawRows[r];
     if (!row) continue;
-    const nameVal = nameIdx !== -1 && row[nameIdx] !== undefined ? String(row[nameIdx]).trim() : '';
-    const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim() : '';
-    const rawTTVal = ttIdx !== -1 && row[ttIdx] !== undefined && row[ttIdx] !== null ? String(row[ttIdx]).trim() : '';
+    const nameVal = nameIdx !== -1 && row[nameIdx] !== undefined ? String(row[nameIdx]).trim().normalize('NFC') : '';
+    const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim().normalize('NFC') : '';
+    const rawTTVal = ttIdx !== -1 && row[ttIdx] !== undefined && row[ttIdx] !== null ? String(row[ttIdx]).trim().normalize('NFC') : '';
 
     if (!nameVal) continue;
 
@@ -926,8 +926,8 @@ export async function parsePL1File(file: File, config?: FileMappingConfig): Prom
   for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
     const row = rawRows[r];
     if (!row) continue;
-    const nameVal = nameIdx !== -1 && row[nameIdx] !== undefined ? String(row[nameIdx]).trim() : '';
-    const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim() : '';
+    const nameVal = nameIdx !== -1 && row[nameIdx] !== undefined ? String(row[nameIdx]).trim().normalize('NFC') : '';
+    const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim().normalize('NFC') : '';
 
     if (nameVal) {
       if (detectChapterHeader(nameVal, '', codeVal, row, nameIdx, codeIdx)) {
@@ -1008,8 +1008,8 @@ export async function parsePL2File(file: File, config?: FileMappingConfig): Prom
   for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
     const row = rawRows[r];
     if (!row) continue;
-    const nameVal = nameIdx !== -1 && row[nameIdx] !== undefined ? String(row[nameIdx]).trim() : '';
-    const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim() : '';
+    const nameVal = nameIdx !== -1 && row[nameIdx] !== undefined ? String(row[nameIdx]).trim().normalize('NFC') : '';
+    const codeVal = codeIdx !== -1 && row[codeIdx] !== undefined ? String(row[codeIdx]).trim().normalize('NFC') : '';
 
     if (nameVal) {
       if (detectChapterHeader(nameVal, '', codeVal, row, nameIdx, codeIdx)) {
@@ -1099,9 +1099,14 @@ export async function exportMappingToExcel(
   // Thêm từng dòng dữ liệu và tô vàng các dòng có cảnh báo
   results.forEach((r) => {
     const hasWarning = Boolean(r.aiAudit?.hasWarning);
-    const auditStatus = hasWarning
-      ? (r.aiAudit?.severity === 'HIGH' ? '⚠️ CẢNH BÁO NGUY CƠ' : '🟡 CẦN LƯU Ý')
-      : (r.tenPL1 || r.tenPL2 ? '✅ Phù hợp' : '⚪ Chưa ghép');
+    let auditStatus = '';
+    if (r.isLocked) {
+      auditStatus = `🔒 ĐÃ CHỐT TAY${r.manualNote ? `: ${r.manualNote}` : ''}`;
+    } else if (hasWarning) {
+      auditStatus = r.aiAudit?.severity === 'HIGH' ? '⚠️ CẢNH BÁO NGUY CƠ' : '🟡 CẦN LƯU Ý';
+    } else {
+      auditStatus = r.tenPL1 || r.tenPL2 ? '✅ Phù hợp' : '⚪ Chưa ghép';
+    }
 
     const auditNote = hasWarning
       ? `${r.aiAudit?.reason || ''}${r.aiAudit?.recommendation ? ` -> Khuyến nghị: ${r.aiAudit.recommendation}` : ''}`

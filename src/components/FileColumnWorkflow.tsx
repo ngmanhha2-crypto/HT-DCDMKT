@@ -24,6 +24,7 @@ import {
   ArrowUpDown,
   ChevronUp,
   ChevronDown,
+  Zap,
 } from 'lucide-react';
 import { FileInspection, OutputColumnConfig, FileMappingConfig, ColumnSourceGroup, ExtraColumnDefinition } from '../types';
 import { DEFAULT_OUTPUT_COLUMNS } from '../utils/excelParser';
@@ -922,6 +923,11 @@ export const FileColumnWorkflow: React.FC<FileColumnWorkflowProps> = ({
                   <label htmlFor="anatomy-filter-chk" className="text-xs font-medium text-slate-700 cursor-pointer">
                     Khóa cơ quan giải phẫu (Chặn nhầm lẫn Dạ dày ↔ Đại tràng)
                   </label>
+                </div>
+
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-sky-100/80 text-sky-900 border border-sky-200 text-xs font-semibold">
+                  <Zap className="w-3.5 h-3.5 text-sky-600" />
+                  <span>Web Worker Đa Luồng: Hỗ trợ file lớn (&gt; 10.000 dòng) không đơ máy</span>
                 </div>
               </div>
             </div>

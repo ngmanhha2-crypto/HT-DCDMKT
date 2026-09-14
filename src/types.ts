@@ -65,6 +65,38 @@ export interface MappingResult {
   boPhanPL2?: string;
   aiAudit?: AiAuditInfo;
   extraValues?: Record<string, any>;
+  isLocked?: boolean;          // Khóa dòng thủ công, ngăn thuật toán ghi đè khi chạy lại
+  isManualOverride?: boolean;  // Đã được người dùng chỉnh sửa tay
+  manualNote?: string;         // Ghi chú thẩm định của cán bộ y tế
+  lockedAt?: string;           // Thời điểm chốt dòng (ISO string)
+}
+
+export interface SavedSession {
+  id: string;
+  savedAt: string; // ISO string
+  title: string;
+  sourceItemCount: number;
+  pl1ItemCount: number;
+  pl2ItemCount: number;
+  resultCount: number;
+  lockedCount: number;
+  stats?: ProcessingStats | null;
+  results: MappingResult[];
+  sourceItems: SourceItem[];
+  pl1Items: TargetItem[];
+  pl2Items: TargetItem[];
+  threshold: number;
+  enableAnatomyFilter: boolean;
+  extraColumns?: ExtraColumnDefinition[];
+}
+
+export interface SavedSessionSummary {
+  id: string;
+  savedAt: string;
+  title: string;
+  sourceItemCount: number;
+  resultCount: number;
+  lockedCount: number;
 }
 
 export interface ExtraColumnDefinition {

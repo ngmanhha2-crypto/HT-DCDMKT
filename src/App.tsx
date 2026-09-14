@@ -39,8 +39,14 @@ import {
   X,
   Filter,
   Keyboard,
+  Lock,
+  Unlock,
+  Edit3,
+  Database,
+  Save,
+  HardDrive,
 } from 'lucide-react';
-import { SourceItem, TargetItem, MappingResult, ProcessingStats, FileInspection, OutputColumnConfig, FileMappingConfig, ExtraColumnDefinition } from './types';
+import { SourceItem, TargetItem, MappingResult, ProcessingStats, FileInspection, OutputColumnConfig, FileMappingConfig, ExtraColumnDefinition, SavedSession } from './types';
 import { auditMappingRowWithRules } from './utils/clinicalRules';
 import {
   createTargetIndex,
@@ -70,6 +76,15 @@ import { DeployGuideModal } from './components/DeployGuideModal';
 import { ClinicalAuditModal } from './components/ClinicalAuditModal';
 import { FileColumnWorkflow } from './components/FileColumnWorkflow';
 import { KeyboardShortcutsModal } from './components/KeyboardShortcutsModal';
+import { ManualOverrideModal } from './components/ManualOverrideModal';
+import { SessionManagerModal } from './components/SessionManagerModal';
+import { InlineFuzzySearchCell } from './components/InlineFuzzySearchCell';
+import { autoSaveCurrentSession, loadCurrentSession, CURRENT_SESSION_ID } from './utils/indexedDBStorage';
+import {
+  startMatchingWorkerJob,
+  MatchingJobController,
+  isWebWorkerSupported,
+} from './utils/matchingWorkerManager';
 
 /**
  * Kiểm tra xem một dòng kết quả kỹ thuật có khớp với tiêu chí lọc Chuyên khoa hay không.
@@ -301,8 +316,15 @@ export default function App() {
   const [processedCount, setProcessedCount] = useState<number>(0);
   const [totalCount, setTotalCount] = useState<number>(0);
 
-  // Cờ hủy tiến trình (Cancel Token)
+  // Cờ hủy tiến trình (Cancel Token) & Web Worker Manager
   const isCancelledRef = useRef<boolean>(false);
+  const [isWorkerActive, setIsWorkerActive] = useState<boolean>(false);
+  const activeWorkerJobRef = useRef<MatchingJobController | null>(null);
+
+  // Danh mục dữ liệu đã nạp (dùng cho tìm kiếm, autocomplete chỉnh sửa tay, và lưu phiên)
+  const [sourceItems, setSourceItems] = useState<SourceItem[]>([]);
+  const [pl1Items, setPL1Items] = useState<TargetItem[]>([]);
+  const [pl2Items, setPL2Items] = useState<TargetItem[]>([]);
 
   // Kết quả & Thống kê
   const [results, setResults] = useState<MappingResult[]>([]);
@@ -311,9 +333,19 @@ export default function App() {
   // Bảng hiển thị & Phân trang (Pagination)
   const [searchFilter, setSearchFilter] = useState<string>('');
   const [selectedSpecialty, setSelectedSpecialty] = useState<string>('all');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'warning_only' | 'both' | 'pl1_only' | 'pl2_only' | 'unmatched'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'warning_only' | 'locked_only' | 'both' | 'pl1_only' | 'pl2_only' | 'unmatched'>('all');
   const [pageSize, setPageSize] = useState<number>(25);
   const [currentPage, setCurrentPage] = useState<number>(1);
+
+  // Trạng thái Chỉnh sửa tay (Manual Override) & Khóa dòng
+  const [isOverrideModalOpen, setIsOverrideModalOpen] = useState<boolean>(false);
+  const [overrideRow, setOverrideRow] = useState<MappingResult | null>(null);
+
+  // Trạng thái Tự động lưu phiên (IndexedDB Session Persistence)
+  const [isSessionModalOpen, setIsSessionModalOpen] = useState<boolean>(false);
+  const [lastSavedTime, setLastSavedTime] = useState<string | null>(null);
+  const [isAutoSaving, setIsAutoSaving] = useState<boolean>(false);
+  const [recoveredSessionPrompt, setRecoveredSessionPrompt] = useState<SavedSession | null>(null);
 
   // Trạng thái AI Rà Soát & Thẩm Định (Gemini 3.8 Flash)
   const [isAiAuditing, setIsAiAuditing] = useState<boolean>(false);
@@ -332,6 +364,66 @@ export default function App() {
       return next;
     });
   };
+
+  // Kiểm tra phiên làm việc trước đó trong IndexedDB khi khởi động app
+  useEffect(() => {
+    async function checkSavedSession() {
+      try {
+        const saved = await loadCurrentSession();
+        if (saved && saved.results && saved.results.length > 0) {
+          setRecoveredSessionPrompt(saved);
+        }
+      } catch (err) {
+        console.warn('Không thể đọc phiên trước đó từ IndexedDB:', err);
+      }
+    }
+    checkSavedSession();
+  }, []);
+
+  // Tự động lưu phiên (Debounced Auto-save to IndexedDB) khi results thay đổi
+  const autoSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (results.length === 0) return;
+
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+
+    autoSaveTimerRef.current = setTimeout(async () => {
+      setIsAutoSaving(true);
+      try {
+        const sessionToSave: SavedSession = {
+          id: CURRENT_SESSION_ID,
+          savedAt: new Date().toISOString(),
+          title: `Phiên tự động lưu lúc ${new Date().toLocaleTimeString('vi-VN')}`,
+          sourceItemCount: sourceItems.length,
+          pl1ItemCount: pl1Items.length,
+          pl2ItemCount: pl2Items.length,
+          resultCount: results.length,
+          lockedCount: results.filter((r) => r.isLocked).length,
+          stats,
+          results,
+          sourceItems,
+          pl1Items,
+          pl2Items,
+          threshold,
+          enableAnatomyFilter,
+          extraColumns: [...extraColumnsGoc, ...extraColumnsPL1, ...extraColumnsPL2],
+        };
+
+        await autoSaveCurrentSession(sessionToSave);
+        setLastSavedTime(new Date().toLocaleTimeString('vi-VN'));
+      } catch (err) {
+        console.warn('Lỗi tự động lưu phiên:', err);
+      } finally {
+        setIsAutoSaving(false);
+      }
+    }, 1200);
+
+    return () => {
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    };
+  }, [results, stats, threshold, enableAnatomyFilter, sourceItems, pl1Items, pl2Items, extraColumnsGoc, extraColumnsPL1, extraColumnsPL2]);
 
   // Xử lý khi tải file Excel lên: Tự động quét dòng tiêu đề theo cột STT
   const handleFileUpload = async (type: 'SOURCE' | 'PL1' | 'PL2', file: File) => {
@@ -396,6 +488,10 @@ export default function App() {
     setInspectionPL1(inspPL1);
     setInspectionPL2(inspPL2);
 
+    setSourceItems(getSampleSourceList());
+    setPL1Items(getSampleTargetPL1());
+    setPL2Items(getSampleTargetPL2());
+
     setConfigGoc({
       headerRowIdx: inspGoc.headerRowIndex,
       nameColIdx: inspGoc.selectedNameColumnIndex,
@@ -416,6 +512,11 @@ export default function App() {
 
   // Reset toàn bộ
   const handleReset = () => {
+    if (activeWorkerJobRef.current) {
+      activeWorkerJobRef.current.cancel();
+      activeWorkerJobRef.current = null;
+    }
+    setIsWorkerActive(false);
     isCancelledRef.current = true;
     setFileGoc(null);
     setFilePL1(null);
@@ -430,6 +531,9 @@ export default function App() {
     setExtraColumnsPL2([]);
     setColumnsConfig(DEFAULT_OUTPUT_COLUMNS.map((c) => ({ ...c })));
     setResults([]);
+    setSourceItems([]);
+    setPL1Items([]);
+    setPL2Items([]);
     setStats(null);
     setErrorMessage(null);
     setProgress(0);
@@ -444,10 +548,15 @@ export default function App() {
   // Hủy bỏ tiến trình đang chạy
   const handleCancelProcessing = () => {
     isCancelledRef.current = true;
+    if (activeWorkerJobRef.current) {
+      activeWorkerJobRef.current.cancel();
+      activeWorkerJobRef.current = null;
+    }
+    setIsWorkerActive(false);
     setStatusMessage('Đang dừng tiến trình...');
   };
 
-  // Chạy Mapping Tối ưu hóa cho Big Data & Không chặn UI
+  // Chạy Mapping Tối ưu hóa cho Big Data (> 10.000 dòng) qua Web Worker Đa Luồng (Off-Thread)
   const handleStartMapping = async () => {
     setErrorMessage(null);
     setIsProcessing(true);
@@ -499,154 +608,54 @@ export default function App() {
 
       if (isCancelledRef.current) throw new Error('Đã hủy tiến trình bởi người dùng.');
 
-      // BƯỚC TẠO CHỈ MỤC TĂNG TỐC (PRE-INDEXING)
-      setStatusMessage('Đang tạo chỉ mục tìm kiếm siêu tốc (Inverted Index) cho Phụ lục 1...');
-      setProgress(35);
-      await new Promise((r) => setTimeout(r, 10));
-      const indexPL1 = createTargetIndex(pl1Items);
-
-      setStatusMessage('Đang tạo chỉ mục tìm kiếm siêu tốc (Inverted Index) cho Phụ lục 2...');
-      setProgress(42);
-      await new Promise((r) => setTimeout(r, 10));
-      const indexPL2 = createTargetIndex(pl2Items);
-
-      const total = sourceItems.length;
-      setTotalCount(total);
+      // Lưu trữ dữ liệu danh mục vào state cho Autocomplete Chỉnh sửa tay và Lưu phiên
+      setSourceItems(sourceItems);
+      setPL1Items(pl1Items);
+      setPL2Items(pl2Items);
+      setTotalCount(sourceItems.length);
       setProcessedCount(0);
-      const cutoff = threshold / 100.0;
-      const mappedResults: MappingResult[] = [];
 
-      let matchedPL1 = 0;
-      let matchedPL2 = 0;
-      let matchedBoth = 0;
-      let unmatched = 0;
+      // BƯỚC THỰC THI TRÊN WEB WORKER ĐA LUỒNG (Off-Thread Big Data Fuzzy Engine)
+      const isSupported = isWebWorkerSupported();
+      setIsWorkerActive(isSupported);
 
-      const startTime = performance.now();
-      const BATCH_SIZE = 50; // Xử lý theo lô 50 mục và nhường quyền (yield) cho Main Thread
-
-      let stt1Counter = 0; // Bộ đếm STT 1 tích lũy - CHỈ TĂNG KHI STT 2 LÀ SỐ
-
-      for (let i = 0; i < total; i += BATCH_SIZE) {
-        if (isCancelledRef.current) {
-          throw new Error('Đã hủy tiến trình đối chiếu theo yêu cầu.');
-        }
-
-        const chunkEnd = Math.min(i + BATCH_SIZE, total);
-
-        for (let j = i; j < chunkEnd; j++) {
-          const item = sourceItems[j];
-
-          // Bóc tách cơ quan giải phẫu và chuyên khoa của danh mục gốc
-          const sourceComp = item.component || decomposeMedicalProcedure(item.name);
-
-          // Khớp Phụ lục 1 với bộ lọc giải phẫu thông minh 2 tầng
-          const matchPL1 = getBestMatchWithIndex(item.name, indexPL1, cutoff, enableAnatomyFilter);
-
-          // Khớp Phụ lục 2 với bộ lọc giải phẫu thông minh 2 tầng
-          const matchPL2 = getBestMatchWithIndex(item.name, indexPL2, cutoff, enableAnatomyFilter);
-
-          // STT 2: Giữ nguyên hoàn toàn theo file danh mục gốc (KHÔNG gán j + 1 để khắc phục lỗi nhảy số)
-          const stt2FromSource = item.stt2 !== undefined ? item.stt2 : '';
-
-          // STT 1: CHỈ TĂNG KHI STT 2 LÀ SỐ
-          let stt1Val: number | string = '';
-          if (isNumericSTT(stt2FromSource)) {
-            stt1Counter++;
-            stt1Val = stt1Counter;
-          } else {
-            stt1Val = '';
-          }
-
-          // Trích xuất các cột bổ sung từ từng file đã chọn
-          const extraValues: Record<string, any> = {};
-
-          // Trích xuất từ File Danh mục gốc
-          for (const ec of extraColumnsGoc) {
-            const rawVal = item.rawRow?.[ec.columnIndex];
-            extraValues[ec.id] = rawVal !== undefined && rawVal !== null ? String(rawVal).trim() : '';
-          }
-
-          // Trích xuất từ Phụ Lục 1 (theo mục tương ứng được khớp)
-          for (const ec of extraColumnsPL1) {
-            if (matchPL1.matchedItem?.rawRow) {
-              const rawVal = matchPL1.matchedItem.rawRow[ec.columnIndex];
-              extraValues[ec.id] = rawVal !== undefined && rawVal !== null ? String(rawVal).trim() : '';
-            } else {
-              extraValues[ec.id] = '';
-            }
-          }
-
-          // Trích xuất từ Phụ Lục 2 (theo mục tương ứng được khớp)
-          for (const ec of extraColumnsPL2) {
-            if (matchPL2.matchedItem?.rawRow) {
-              const rawVal = matchPL2.matchedItem.rawRow[ec.columnIndex];
-              extraValues[ec.id] = rawVal !== undefined && rawVal !== null ? String(rawVal).trim() : '';
-            } else {
-              extraValues[ec.id] = '';
-            }
-          }
-
-          const mappedRow: MappingResult = {
-            rowId: j + 1,
-            stt1: stt1Val,
-            stt2: stt2FromSource,
-            maGoc: item.code,
-            maPL1: matchPL1.code,
-            maPL2: matchPL2.code,
-            tenGoc: item.name,
-            tenPL1: matchPL1.name,
-            tenPL2: matchPL2.name,
-            scorePL1: matchPL1.score,
-            scorePL2: matchPL2.score,
-            qtktBenhVien: '',
-            soDonViThucHien: '',
-            boPhanGoc: sourceComp.anatomyList.length > 0 ? sourceComp.anatomyList.join(', ') : undefined,
-            chuyenKhoaGoc: item.chapter || (sourceComp.primaryCategory ? ANATOMY_ONTOLOGY[sourceComp.primaryCategory]?.name : undefined) || 'Chưa phân loại',
-            boPhanPL1: matchPL1.anatomy,
-            boPhanPL2: matchPL2.anatomy,
-            extraValues,
-          };
-          mappedRow.aiAudit = auditMappingRowWithRules(mappedRow);
-          mappedResults.push(mappedRow);
-
-          if (matchPL1.name) matchedPL1++;
-          if (matchPL2.name) matchedPL2++;
-          if (matchPL1.name && matchPL2.name) matchedBoth++;
-          if (!matchPL1.name && !matchPL2.name) unmatched++;
-        }
-
-        // Đo đạc tốc độ xử lý & Cập nhật UI
-        const now = performance.now();
-        const elapsedSec = (now - startTime) / 1000;
-        const currentSpeed = Math.round(chunkEnd / Math.max(0.05, elapsedSec));
-        const estRemaining = Math.max(0, Math.round((total - chunkEnd) / Math.max(1, currentSpeed)));
-        const pct = 45 + Math.floor((chunkEnd / total) * 53);
-
-        setProcessedCount(chunkEnd);
-        setProgress(pct);
-        setProcessingSpeed(currentSpeed);
-        setRemainingSeconds(estRemaining);
-        setStatusMessage(
-          `Đang đối chiếu: ${chunkEnd.toLocaleString()} / ${total.toLocaleString()} danh mục • Tốc độ: ~${currentSpeed.toLocaleString()} dòng/giây`
-        );
-
-        // Nhường quyền cho trình duyệt cập nhật giao diện (tránh đơ tab)
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-
-      const totalTimeSec = Math.round(((performance.now() - startTime) / 1000) * 10) / 10;
-      setProgress(100);
-      setStatusMessage(`Hoàn tất đối chiếu ${total.toLocaleString()} mục trong ${totalTimeSec}s!`);
-      setResults(mappedResults);
-      setStats({
-        total,
-        matchedPL1,
-        matchedPL2,
-        matchedBoth,
-        unmatched,
-        durationSeconds: totalTimeSec,
-        speedRowsPerSec: Math.round(total / Math.max(0.1, totalTimeSec)),
+      const controller = startMatchingWorkerJob({
+        sourceItems,
+        pl1Items,
+        pl2Items,
+        threshold,
+        enableAnatomyFilter,
+        extraColumnsGoc,
+        extraColumnsPL1,
+        extraColumnsPL2,
+        lockedRows: results.filter((r) => r.isLocked),
+        onProgress: (prog) => {
+          setProgress(prog.percent);
+          setProcessedCount(prog.processed);
+          setTotalCount(prog.total);
+          setProcessingSpeed(prog.speedRowsPerSec);
+          setRemainingSeconds(prog.estimatedRemainingSec);
+          setStatusMessage(prog.statusMessage);
+        },
       });
+
+      activeWorkerJobRef.current = controller;
+
+      const jobResult = await controller.promise;
+      activeWorkerJobRef.current = null;
+      setIsWorkerActive(false);
+
+      const { results: mappedResults, stats: computedStats, isWorker } = jobResult;
+
+      setProgress(100);
+      const lockedCount = mappedResults.filter((r) => r.isLocked).length;
+      const lockedNotice = lockedCount > 0 ? ` (Bảo lưu ${lockedCount} dòng đã chốt tay)` : '';
+      const workerBadge = isWorker ? ' [Web Worker đa luồng]' : '';
+      setStatusMessage(
+        `Hoàn tất đối chiếu ${computedStats.total.toLocaleString()} mục trong ${computedStats.durationSeconds}s${workerBadge}${lockedNotice}!`
+      );
+      setResults(mappedResults);
+      setStats(computedStats);
       setCurrentPage(1);
     } catch (err: any) {
       setErrorMessage(
@@ -655,6 +664,8 @@ export default function App() {
       setProgress(0);
     } finally {
       setIsProcessing(false);
+      setIsWorkerActive(false);
+      activeWorkerJobRef.current = null;
       isCancelledRef.current = false;
     }
   };
@@ -816,14 +827,72 @@ export default function App() {
     );
   };
 
+  // Mở modal Chỉnh sửa tay (Manual Override)
+  const handleOpenOverride = (row: MappingResult) => {
+    setOverrideRow(row);
+    setIsOverrideModalOpen(true);
+  };
+
+  // Lưu chỉnh sửa tay từ modal
+  const handleSaveOverride = (updatedRow: MappingResult) => {
+    setResults((prev) =>
+      prev.map((r) => (r.rowId === updatedRow.rowId ? updatedRow : r))
+    );
+  };
+
+  // Chuyển đổi trạng thái Khóa dòng (Toggle Row Lock)
+  const handleToggleRowLock = (rowId: number, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setResults((prev) =>
+      prev.map((r) => {
+        if (r.rowId !== rowId) return r;
+        const nextLocked = !r.isLocked;
+        return {
+          ...r,
+          isLocked: nextLocked,
+          isManualOverride: nextLocked || r.isManualOverride,
+          lockedAt: nextLocked ? (r.lockedAt || new Date().toISOString()) : undefined,
+        };
+      })
+    );
+  };
+
+  // Khôi phục phiên làm việc từ IndexedDB
+  const handleRestoreSession = (session: SavedSession) => {
+    if (!session || !session.results) return;
+    setResults(session.results);
+    if (session.sourceItems && session.sourceItems.length > 0) {
+      setSourceItems(session.sourceItems);
+    }
+    if (session.pl1Items && session.pl1Items.length > 0) {
+      setPL1Items(session.pl1Items);
+    }
+    if (session.pl2Items && session.pl2Items.length > 0) {
+      setPL2Items(session.pl2Items);
+    }
+    if (session.stats) {
+      setStats(session.stats);
+    }
+    if (session.threshold) {
+      setThreshold(session.threshold);
+    }
+    if (session.enableAnatomyFilter !== undefined) {
+      setEnableAnatomyFilter(session.enableAnatomyFilter);
+    }
+    setRecoveredSessionPrompt(null);
+    setCurrentPage(1);
+    setStatusMessage(`Đã khôi phục thành công phiên làm việc (${session.results.length.toLocaleString()} danh mục, ${session.lockedCount || 0} dòng khóa)!`);
+  };
+
   // Xuất file Excel (Tự động tô vàng các dòng có cảnh báo và áp dụng thứ tự/tiêu đề cột tùy biến)
   const handleDownloadExcel = () => {
     if (results.length === 0) return;
     exportMappingToExcel(results, columnsConfig);
   };
 
-  // Số lượng cảnh báo phát hiện
+  // Số lượng cảnh báo phát hiện & số dòng chốt tay
   const warningCount = results.filter((r) => r.aiAudit?.hasWarning).length;
+  const lockedCount = results.filter((r) => r.isLocked).length;
 
   // Phân loại và tổng hợp danh mục chuyên khoa động từ dữ liệu thực tế của file gốc và hệ giải phẫu
   const specialtyClassification = useMemo(() => {
@@ -916,6 +985,7 @@ export default function App() {
   const filteredResults = results.filter((r) => {
     // Lọc theo trạng thái
     if (statusFilter === 'warning_only' && !r.aiAudit?.hasWarning) return false;
+    if (statusFilter === 'locked_only' && !r.isLocked) return false;
     if (statusFilter === 'both' && (!r.tenPL1 || !r.tenPL2)) return false;
     if (statusFilter === 'pl1_only' && (!r.tenPL1 || r.tenPL2)) return false;
     if (statusFilter === 'pl2_only' && (r.tenPL1 || !r.tenPL2)) return false;
@@ -938,6 +1008,7 @@ export default function App() {
       r.tenPL2.toLowerCase().includes(q) ||
       r.maPL1.toLowerCase().includes(q) ||
       r.maPL2.toLowerCase().includes(q) ||
+      (r.manualNote && r.manualNote.toLowerCase().includes(q)) ||
       (r.boPhanGoc && r.boPhanGoc.toLowerCase().includes(q)) ||
       (r.chuyenKhoaGoc && r.chuyenKhoaGoc.toLowerCase().includes(q)) ||
       (r.aiAudit?.reason && r.aiAudit.reason.toLowerCase().includes(q))
@@ -970,6 +1041,8 @@ export default function App() {
     isShortcutsModalOpen,
     auditModalRow,
     isDeployModalOpen,
+    isOverrideModalOpen,
+    isSessionModalOpen,
   });
 
   useEffect(() => {
@@ -985,6 +1058,8 @@ export default function App() {
       isShortcutsModalOpen,
       auditModalRow,
       isDeployModalOpen,
+      isOverrideModalOpen,
+      isSessionModalOpen,
     };
   }, [
     results,
@@ -998,6 +1073,8 @@ export default function App() {
     isShortcutsModalOpen,
     auditModalRow,
     isDeployModalOpen,
+    isOverrideModalOpen,
+    isSessionModalOpen,
   ]);
 
   // Đăng ký các phím tắt bàn phím toàn cục cho cán bộ y tế
@@ -1124,15 +1201,31 @@ export default function App() {
         }
       }
 
-      // 8. Phím tắt mở bảng tra cứu phím tắt '?'
+      // 8. Phím tắt Alt + M: Mở Quản lý phiên làm việc IndexedDB
+      if ((e.altKey && (e.key === 'm' || e.key === 'M')) || (cmdOrCtrl && e.shiftKey && (e.key === 'm' || e.key === 'M'))) {
+        e.preventDefault();
+        setIsSessionModalOpen((prev) => !prev);
+        showShortcutFeedback('⚡ Alt+M: Mở Quản lý phiên làm việc IndexedDB', 'info');
+        return;
+      }
+
+      // 9. Phím tắt mở bảng tra cứu phím tắt '?'
       if (!isTyping && (e.key === '?' || (e.shiftKey && e.key === '/'))) {
         e.preventDefault();
         setIsShortcutsModalOpen((prev) => !prev);
         return;
       }
 
-      // 9. Phím tắt Escape: Đóng các modal hoặc thoát ô tìm kiếm
+      // 10. Phím tắt Escape: Đóng các modal hoặc thoát ô tìm kiếm
       if (e.key === 'Escape') {
+        if (state.isOverrideModalOpen) {
+          setIsOverrideModalOpen(false);
+          return;
+        }
+        if (state.isSessionModalOpen) {
+          setIsSessionModalOpen(false);
+          return;
+        }
         if (state.isShortcutsModalOpen) {
           setIsShortcutsModalOpen(false);
           return;
@@ -1161,6 +1254,40 @@ export default function App() {
     handleLoadSampleData,
     handleReset,
     showShortcutFeedback,
+  ]);
+
+  // Đối tượng phiên hiện tại để cung cấp cho Modal Quản lý phiên
+  const currentSessionData = useMemo<SavedSession | null>(() => {
+    if (results.length === 0) return null;
+    return {
+      id: CURRENT_SESSION_ID,
+      savedAt: new Date().toISOString(),
+      title: `Phiên làm việc (${results.length.toLocaleString()} danh mục)`,
+      sourceItemCount: sourceItems.length,
+      pl1ItemCount: pl1Items.length,
+      pl2ItemCount: pl2Items.length,
+      resultCount: results.length,
+      lockedCount: results.filter((r) => r.isLocked).length,
+      stats,
+      results,
+      sourceItems,
+      pl1Items,
+      pl2Items,
+      threshold,
+      enableAnatomyFilter,
+      extraColumns: [...extraColumnsGoc, ...extraColumnsPL1, ...extraColumnsPL2],
+    };
+  }, [
+    results,
+    sourceItems,
+    pl1Items,
+    pl2Items,
+    stats,
+    threshold,
+    enableAnatomyFilter,
+    extraColumnsGoc,
+    extraColumnsPL1,
+    extraColumnsPL2,
   ]);
 
   return (
@@ -1241,6 +1368,48 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-7 space-y-7">
+        {/* Banner thông báo phát hiện phiên làm việc chưa lưu trong IndexedDB */}
+        {recoveredSessionPrompt && results.length === 0 && (
+          <div className="bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-300 p-4 rounded-xl shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in slide-in-from-top-2">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 bg-amber-100 text-amber-800 rounded-lg shrink-0">
+                <RotateCcw className="w-5 h-5 text-amber-700" />
+              </div>
+              <div>
+                <div className="text-xs sm:text-sm font-bold text-amber-950 flex items-center gap-2 flex-wrap">
+                  <span>Phát hiện phiên làm việc trước đó được tự động lưu trong IndexedDB</span>
+                  <span className="px-2 py-0.5 rounded-full text-[11px] bg-amber-200 text-amber-900 font-mono font-medium">
+                    {new Date(recoveredSessionPrompt.savedAt).toLocaleTimeString('vi-VN')}
+                  </span>
+                </div>
+                <div className="text-xs text-amber-800 mt-0.5">
+                  Gồm <b>{recoveredSessionPrompt.results.length.toLocaleString()}</b> danh mục kỹ thuật
+                  {recoveredSessionPrompt.lockedCount > 0 && (
+                    <span> (trong đó có <b className="text-amber-950 font-bold">{recoveredSessionPrompt.lockedCount}</b> dòng đã khóa chốt tay)</span>
+                  )}. Bạn có muốn khôi phục lại không?
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+              <button
+                type="button"
+                onClick={() => handleRestoreSession(recoveredSessionPrompt)}
+                className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs rounded-lg shadow-xs transition-colors cursor-pointer flex items-center gap-1.5"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Khôi phục ngay</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setRecoveredSessionPrompt(null)}
+                className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-600 text-xs rounded-lg border border-slate-200 transition-colors cursor-pointer"
+              >
+                Bỏ qua
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Step 1 & 2: Upload, Interactive Inspection & Column Customization */}
         <FileColumnWorkflow
           fileGoc={fileGoc}
@@ -1294,10 +1463,29 @@ export default function App() {
           <>
             {/* Progress Bar & Realtime Performance Metrics */}
             {isProcessing && (
-              <div className="space-y-3 bg-sky-50/70 p-4 rounded-xl border border-sky-100 shadow-xs">
+              <div className="space-y-3 bg-sky-50/80 p-4 rounded-xl border border-sky-200 shadow-xs">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between text-xs font-semibold text-sky-950 gap-2">
-                  <span className="truncate">{statusMessage}</span>
-                  <span className="text-sky-700 font-mono text-sm shrink-0">{progress}%</span>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="truncate">{statusMessage}</span>
+                    {isWorkerActive && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold bg-sky-200/90 text-sky-900 border border-sky-300 shadow-2xs shrink-0">
+                        <Zap className="w-3 h-3 text-sky-700 animate-pulse" />
+                        <span>Web Worker Đa Luồng (60 FPS)</span>
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0">
+                    <span className="text-sky-700 font-mono text-sm font-bold">{progress}%</span>
+                    <button
+                      type="button"
+                      onClick={handleCancelProcessing}
+                      className="px-2.5 py-1 text-xs font-semibold text-rose-700 hover:text-rose-800 bg-white hover:bg-rose-50 border border-rose-300 rounded-lg shadow-2xs transition-colors cursor-pointer flex items-center gap-1"
+                      title="Dừng tiến trình đối chiếu ngay lập tức"
+                    >
+                      <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                      <span>Hủy tiến trình</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Visual Progress Bar */}
@@ -1310,17 +1498,24 @@ export default function App() {
 
                 {/* Speed & Remaining Time Badges */}
                 {totalCount > 0 && (
-                  <div className="flex flex-wrap items-center gap-4 text-xs text-slate-600 pt-1">
-                    <span className="flex items-center gap-1.5 font-mono">
-                      <Gauge className="w-3.5 h-3.5 text-sky-600" />
-                      Tốc độ: <b>{processingSpeed.toLocaleString()}</b> dòng/giây
-                    </span>
-                    <span className="flex items-center gap-1.5 font-mono">
-                      <Timer className="w-3.5 h-3.5 text-sky-600" />
-                      Ước tính còn lại: <b>~{remainingSeconds}</b> giây
-                    </span>
-                    <span className="text-slate-400">
-                      ({processedCount.toLocaleString()} / {totalCount.toLocaleString()} dòng)
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600 pt-1">
+                    <div className="flex flex-wrap items-center gap-4">
+                      <span className="flex items-center gap-1.5 font-mono">
+                        <Gauge className="w-3.5 h-3.5 text-sky-600" />
+                        Tốc độ: <b>{processingSpeed.toLocaleString()}</b> dòng/giây
+                      </span>
+                      <span className="flex items-center gap-1.5 font-mono">
+                        <Timer className="w-3.5 h-3.5 text-sky-600" />
+                        Ước tính còn lại: <b>~{remainingSeconds}</b> giây
+                      </span>
+                      <span className="text-slate-400">
+                        ({processedCount.toLocaleString()} / {totalCount.toLocaleString()} dòng)
+                      </span>
+                    </div>
+
+                    <span className="text-[11px] text-sky-800/80 font-medium hidden md:inline-flex items-center gap-1">
+                      <Sparkles className="w-3 h-3 text-sky-600" />
+                      Chạy tách biệt hoàn toàn khỏi luồng chính (Không lag tab)
                     </span>
                   </div>
                 )}
@@ -1408,8 +1603,43 @@ export default function App() {
                   </p>
                 </div>
 
-                {/* Action Buttons: AI Audit & Download Excel */}
+                {/* Action Buttons: Session Status, Session Manager, AI Audit & Download Excel */}
                 <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+                  {/* Trạng thái Tự động lưu */}
+                  <div
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs bg-slate-100/90 border border-slate-200 text-slate-600 shadow-2xs"
+                    title={lastSavedTime ? `Đã lưu tự động lúc ${lastSavedTime} vào IndexedDB` : 'Tự động lưu vào IndexedDB'}
+                  >
+                    {isAutoSaving ? (
+                      <>
+                        <div className="w-3 h-3 border-2 border-sky-600 border-t-transparent rounded-full animate-spin" />
+                        <span className="text-sky-700 font-medium">Đang lưu...</span>
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                        <span className="text-slate-600">Đã lưu: <b className="text-slate-800">{lastSavedTime || 'Mới nhất'}</b></span>
+                        {lockedCount > 0 && (
+                          <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-100 text-amber-800 font-bold border border-amber-200">
+                            {lockedCount} khóa
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </div>
+
+                  {/* Nút Quản lý phiên IndexedDB */}
+                  <button
+                    id="open-session-manager-btn"
+                    type="button"
+                    onClick={() => setIsSessionModalOpen(true)}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 shadow-xs border border-slate-300 transition-colors cursor-pointer"
+                    title="Mở Quản lý các phiên đã lưu trong IndexedDB, lưu bản chụp hoặc xuất/nhập file JSON"
+                  >
+                    <Database className="w-3.5 h-3.5 text-sky-600" />
+                    <span>Quản lý phiên</span>
+                  </button>
+
                   <button
                     id="run-ai-audit-btn"
                     type="button"
@@ -1507,6 +1737,19 @@ export default function App() {
                   >
                     <AlertTriangle className="w-3.5 h-3.5 text-amber-700" />
                     <span>🟡 Cần lưu ý / Tô vàng ({warningCount})</span>
+                  </button>
+                  <button
+                    id="filter-tab-locked-rows-btn"
+                    onClick={() => { setStatusFilter('locked_only'); setCurrentPage(1); }}
+                    title="Lọc các dòng đã được nhân viên y tế can thiệp chỉnh sửa thủ công & khóa dòng"
+                    className={`px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
+                      statusFilter === 'locked_only'
+                        ? 'bg-amber-700 text-white ring-2 ring-amber-800 shadow-xs'
+                        : 'bg-amber-50/60 hover:bg-amber-100 text-amber-900 border border-amber-300'
+                    }`}
+                  >
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>Đã khóa tay ({lockedCount})</span>
                   </button>
                   <button
                     onClick={() => { setStatusFilter('both'); setCurrentPage(1); }}
@@ -1632,6 +1875,22 @@ export default function App() {
               </div>
             </div>
 
+            {/* Smart Hint Bar for Manual Inline Search & Dropdown Autocomplete */}
+            <div className="px-4 py-2 bg-gradient-to-r from-amber-50/95 via-sky-50/80 to-emerald-50/60 border-b border-amber-200/80 flex items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-2 text-amber-950 font-medium">
+                <Sparkles className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>
+                  <b>Tìm kiếm thủ công tức thì:</b> Nhấp vào bất kỳ ô nào ở cột <b>Tên PL1</b> hoặc <b>Tên PL2</b> (ví dụ gõ <i>"Bóp bóng Ambu"</i>) để hiển thị danh sách thả xuống kết quả gần đúng nhất và chọn thay thế ngay.
+                </span>
+              </div>
+              <span className="text-[11px] text-slate-500 hidden lg:inline-flex items-center gap-1 shrink-0 font-medium">
+                <span>Dùng phím</span>
+                <kbd className="px-1.5 py-0.5 bg-white border border-slate-300 rounded font-mono text-[10px]">↑</kbd>
+                <kbd className="px-1.5 py-0.5 bg-white border border-slate-300 rounded font-mono text-[10px]">↓</kbd>
+                <kbd className="px-1.5 py-0.5 bg-white border border-slate-300 rounded font-mono text-[10px]">Enter</kbd>
+              </span>
+            </div>
+
             {/* Table Content with Virtualized/Paginated Rows */}
             <div className="overflow-x-auto max-h-[520px]">
               <table className="w-full text-left text-xs border-collapse">
@@ -1667,27 +1926,55 @@ export default function App() {
                   {displayRows.length > 0 ? (
                     displayRows.map((row) => {
                       const isWarned = Boolean(row.aiAudit?.hasWarning);
+                      const isLocked = Boolean(row.isLocked);
                       const isPL1Flagged = isWarned && (row.aiAudit?.flagTarget === 'PL1' || row.aiAudit?.flagTarget === 'BOTH');
                       const isPL2Flagged = isWarned && (row.aiAudit?.flagTarget === 'PL2' || row.aiAudit?.flagTarget === 'BOTH');
+
+                      let rowBgClass = 'hover:bg-sky-50/40';
+                      if (isLocked) {
+                        rowBgClass = 'bg-amber-50/70 hover:bg-amber-100/70 border-l-4 border-l-amber-600';
+                      } else if (isWarned) {
+                        rowBgClass = 'bg-amber-50/90 hover:bg-amber-100/90 border-l-4 border-l-amber-500';
+                      }
 
                       return (
                         <tr
                           key={row.rowId}
-                          className={`transition-colors ${
-                            isWarned
-                              ? 'bg-amber-50/90 hover:bg-amber-100/90 border-l-4 border-l-amber-500'
-                              : 'hover:bg-sky-50/40'
-                          }`}
+                          className={`transition-colors ${rowBgClass}`}
                         >
                           {activeSortedColumns.map((col) => {
                             if (col.id === 'stt1') {
                               return (
-                                <td key={col.id} className="p-2.5 text-center font-mono text-slate-500 border-r border-slate-200">
-                                  {row.stt1 !== '' ? (
-                                    <span className="font-semibold text-slate-700">{row.stt1}</span>
-                                  ) : (
-                                    <span className="text-slate-300">-</span>
-                                  )}
+                                <td key={col.id} className="p-2 text-center font-mono text-slate-500 border-r border-slate-200">
+                                  <div className="flex flex-col items-center justify-center gap-0.5">
+                                    {row.stt1 !== '' ? (
+                                      <span className="font-semibold text-slate-700">{row.stt1}</span>
+                                    ) : (
+                                      <span className="text-slate-300">-</span>
+                                    )}
+                                    <div className="flex items-center gap-1 mt-0.5">
+                                      <button
+                                        type="button"
+                                        onClick={(e) => handleToggleRowLock(row.rowId, e)}
+                                        title={row.isLocked ? "Đang khóa dòng (Nhấp để mở khóa)" : "Nhấp để khóa dòng này"}
+                                        className={`p-1 rounded transition-all cursor-pointer ${
+                                          row.isLocked
+                                            ? 'bg-amber-200 text-amber-900 hover:bg-amber-300 border border-amber-400 shadow-2xs'
+                                            : 'text-slate-300 hover:text-slate-600 hover:bg-slate-100'
+                                        }`}
+                                      >
+                                        {row.isLocked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleOpenOverride(row)}
+                                        title="Chỉnh sửa chỉ định thủ công (Manual Override)"
+                                        className="p-1 text-slate-400 hover:text-sky-700 hover:bg-sky-50 rounded transition-all cursor-pointer"
+                                      >
+                                        <Edit3 className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  </div>
                                 </td>
                               );
                             }
@@ -1726,7 +2013,9 @@ export default function App() {
                             if (col.id === 'tenGoc') {
                               return (
                                 <td key={col.id} className="p-2.5 font-medium text-slate-900 border-r border-slate-200">
-                                  <div>{row.tenGoc}</div>
+                                  <div className="leading-snug text-slate-900">
+                                    {row.tenGoc}
+                                  </div>
                                   {(row.chuyenKhoaGoc || row.boPhanGoc) && (
                                     <div className="mt-1 flex items-center gap-1.5 flex-wrap">
                                       {row.chuyenKhoaGoc && (
@@ -1753,66 +2042,42 @@ export default function App() {
                                       )}
                                     </div>
                                   )}
+                                  {row.isLocked && (
+                                    <div className="mt-1.5 flex items-center">
+                                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-100 text-amber-900 border border-amber-300 font-medium leading-tight">
+                                        <Lock className="w-2.5 h-2.5 text-amber-700 shrink-0" />
+                                        <span>Chốt tay{row.manualNote ? `: ${row.manualNote}` : ''}</span>
+                                      </span>
+                                    </div>
+                                  )}
                                 </td>
                               );
                             }
                             if (col.id === 'tenPL1') {
                               return (
-                                <td key={col.id} className="p-2.5 border-r border-slate-200">
-                                  {row.tenPL1 ? (
-                                    <div className={`space-y-1 ${isPL1Flagged ? 'p-1.5 rounded-lg bg-amber-100/90 border border-amber-400' : ''}`}>
-                                      <div className="text-emerald-900 font-medium">{row.tenPL1}</div>
-                                      <div className="flex items-center gap-1.5 flex-wrap">
-                                        <span className="inline-block px-1.5 py-0.2 rounded text-[10px] bg-emerald-100 text-emerald-800 font-mono">
-                                          {row.scorePL1}%
-                                        </span>
-                                        {row.boPhanPL1 && (
-                                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                            <ShieldCheck className="w-2.5 h-2.5 text-emerald-600" />
-                                            {row.boPhanPL1}
-                                          </span>
-                                        )}
-                                        {isPL1Flagged && (
-                                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-amber-200 text-amber-900 font-bold">
-                                            <AlertTriangle className="w-2.5 h-2.5 text-amber-700" />
-                                            Cần lưu ý
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-                                  ) : (
-                                    <span className="text-slate-300 italic">Không khớp ( &lt; {threshold}% )</span>
-                                  )}
+                                <td key={col.id} className="p-1.5 border-r border-slate-200 align-top">
+                                  <InlineFuzzySearchCell
+                                    row={row}
+                                    targetType="PL1"
+                                    targetItems={pl1Items}
+                                    threshold={threshold}
+                                    onUpdateRow={handleSaveOverride}
+                                    isFlagged={isPL1Flagged}
+                                  />
                                 </td>
                               );
                             }
                             if (col.id === 'tenPL2') {
                               return (
-                                <td key={col.id} className="p-2.5 border-r border-slate-200">
-                                  {row.tenPL2 ? (
-                                    <div className={`space-y-1 ${isPL2Flagged ? 'p-1.5 rounded-lg bg-amber-100/90 border border-amber-400' : ''}`}>
-                                      <div className="text-blue-900 font-medium">{row.tenPL2}</div>
-                                      <div className="flex items-center gap-1.5 flex-wrap">
-                                        <span className="inline-block px-1.5 py-0.2 rounded text-[10px] bg-blue-100 text-blue-800 font-mono">
-                                          {row.scorePL2}%
-                                        </span>
-                                        {row.boPhanPL2 && (
-                                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-blue-50 text-blue-700 border border-blue-200">
-                                            <ShieldCheck className="w-2.5 h-2.5 text-blue-600" />
-                                            {row.boPhanPL2}
-                                          </span>
-                                        )}
-                                        {isPL2Flagged && (
-                                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] bg-amber-200 text-amber-900 font-bold">
-                                            <AlertTriangle className="w-2.5 h-2.5 text-amber-700" />
-                                            Cần lưu ý
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-                                  ) : (
-                                    <span className="text-slate-300 italic">Không khớp ( &lt; {threshold}% )</span>
-                                  )}
+                                <td key={col.id} className="p-1.5 border-r border-slate-200 align-top">
+                                  <InlineFuzzySearchCell
+                                    row={row}
+                                    targetType="PL2"
+                                    targetItems={pl2Items}
+                                    threshold={threshold}
+                                    onUpdateRow={handleSaveOverride}
+                                    isFlagged={isPL2Flagged}
+                                  />
                                 </td>
                               );
                             }
@@ -2071,6 +2336,24 @@ export default function App() {
       <KeyboardShortcutsModal
         isOpen={isShortcutsModalOpen}
         onClose={() => setIsShortcutsModalOpen(false)}
+      />
+
+      {/* Modal Chỉnh Sửa Thủ Công (Manual Override) & Khóa Dòng */}
+      <ManualOverrideModal
+        isOpen={isOverrideModalOpen}
+        onClose={() => setIsOverrideModalOpen(false)}
+        row={overrideRow}
+        onSave={handleSaveOverride}
+        pl1Options={pl1Items}
+        pl2Options={pl2Items}
+      />
+
+      {/* Modal Quản Lý Phiên Làm Việc (IndexedDB) */}
+      <SessionManagerModal
+        isOpen={isSessionModalOpen}
+        onClose={() => setIsSessionModalOpen(false)}
+        currentSession={currentSessionData}
+        onRestoreSession={handleRestoreSession}
       />
 
       {/* Thông Báo Trực Quan Khi Kích Hoạt Phím Tắt (Visual Toast) */}
